@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$Version = '0.1.0',
     [string]$ScrcpyVersion = '4.1',
     [string]$ScrcpySha256 = '5b12172b3264b2889f4583ee64752ce832e29bc8b1089dca81093459697165db'
