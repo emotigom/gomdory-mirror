@@ -1,0 +1,41 @@
+name: build-portable
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate PowerShell
+        shell: powershell
+        run: .\tests\Test-Static.ps1
+
+      - name: Validate source structure
+        shell: bash
+        run: python tests/test_source.py
+
+      - name: Build portable ZIP
+        shell: powershell
+        run: |
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          if ($version -eq '${{ github.ref_name }}') { $version = '0.1.0-dev' }
+          .\scripts\build-portable.ps1 -Version $version
+
+      - name: Upload portable package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gomdory-Mirror-Portable
+          path: |
+            dist/Gomdory-Mirror-Portable-*.zip
+            dist/Gomdory-Mirror-Portable-*.zip.sha256
+          if-no-files-found: error

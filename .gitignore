@@ -1,0 +1,6 @@
+dist/
+tools/scrcpy/*
+!tools/scrcpy/.gitkeep
+*.log
+*.zip
+*.sha256
