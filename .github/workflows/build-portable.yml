@@ -24,6 +24,8 @@ jobs:
 
       - name: Validate source structure
         shell: bash
+        env:
+          PYTHONUTF8: '1'
         run: python tests/test_source.py
 
       - name: Build portable ZIP
