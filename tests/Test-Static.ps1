@@ -38,6 +38,10 @@ Assert-True ($appText.Contains('AutoConnectCheck')) '자동 연결 기능이 누
 Assert-True ($appText.Contains('ReadToEndAsync')) 'ADB/scrcpy 비동기 출력 처리가 누락되었습니다.'
 Assert-True ($appText.Contains('Add-MirrorExitDiagnostics')) 'scrcpy 종료 진단이 누락되었습니다.'
 Assert-True ($appText.Contains('LastAutoStartSerial')) '자동 재시작 반복 방지가 누락되었습니다.'
+Assert-True ($appText.Contains("'--no-audio'")) '화면 전용 안정화 옵션이 누락되었습니다.'
+Assert-True ($appText.Contains('Stop-ProcessTree')) '프로세스 트리 종료 처리가 누락되었습니다.'
+Assert-True ($appText.Contains('Restore-ControlWindow')) '단일 미러 창 전환 처리가 누락되었습니다.'
+Assert-True ($appText.Contains('MirrorStopRequested')) '창 닫기 재시작 방지 처리가 누락되었습니다.'
 Assert-True ($launcherText.Contains('%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe')) 'Windows PowerShell 절대 경로 실행이 누락되었습니다.'
 Assert-True (-not ($launcherText.ToCharArray() | Where-Object { [int]$_ -gt 127 })) 'CMD 시작 파일은 코드페이지 충돌 방지를 위해 ASCII만 사용해야 합니다.'
 

@@ -44,6 +44,10 @@ def main() -> int:
         "ReadToEndAsync",
         "Add-MirrorExitDiagnostics",
         "LastAutoStartSerial",
+        "'--no-audio'",
+        "Stop-ProcessTree",
+        "Restore-ControlWindow",
+        "MirrorStopRequested",
     ]
     for fragment in required_fragments:
         require(fragment in source, f"필수 기능 누락: {fragment}")

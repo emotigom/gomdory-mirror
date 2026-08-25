@@ -16,6 +16,8 @@ $script:LastDeviceSerial = ''
 $script:LastAutoStartSerial = ''
 $script:LastStatusKey = ''
 $script:IsClosing = $false
+$script:MirrorStopRequested = $false
+$script:WindowHiddenForMirror = $false
 
 function ConvertTo-XamlSafeText {
     param([AllowNull()][string]$Text)
@@ -185,6 +187,34 @@ function Get-QualityArguments {
     }
 }
 
+function Restore-ControlWindow {
+    if ($script:IsClosing) { return }
+    if (-not $window.IsVisible) { $window.Show() }
+    $window.Activate()
+    $script:WindowHiddenForMirror = $false
+}
+
+function Stop-ProcessTree {
+    param([System.Diagnostics.Process]$Process)
+
+    if ($null -eq $Process) { return }
+    try { $Process.Refresh() } catch { return }
+    if ($Process.HasExited) { return }
+
+    try { $Process.CloseMainWindow() | Out-Null } catch { }
+    if ($Process.WaitForExit(900)) { return }
+
+    # scrcpy가 남긴 자식 프로세스까지 함께 끝내서 다음 연결에 영향을 주지 않게 합니다.
+    $taskKill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+    try {
+        $kill = Start-Process -FilePath $taskKill -ArgumentList @('/PID', "$($Process.Id)", '/T', '/F') -NoNewWindow -PassThru
+        $kill.WaitForExit(3000) | Out-Null
+    }
+    catch {
+        try { $Process.Kill() } catch { }
+    }
+}
+
 function Start-Mirror {
     param($Device)
 
@@ -195,11 +225,12 @@ function Start-Mirror {
     }
 
     $arguments = @(
-        '--serial', $Device.Serial,
-        '--window-title', '곰도리 미러 · 수업 화면',
+        "--serial=$($Device.Serial)",
+        '--window-title=곰도리 미러',
         '--stay-awake',
         '--disable-screensaver',
-        '--no-control'
+        '--no-control',
+        '--no-audio'
     )
     $arguments += Get-QualityArguments -Quality ([string]$QualityCombo.SelectedItem.Content)
     if ($FullscreenCheck.IsChecked) { $arguments += '--fullscreen' }
@@ -216,6 +247,7 @@ function Start-Mirror {
     }) -join ' '
 
     try {
+        $script:MirrorStopRequested = $false
         $script:MirrorProcess = [System.Diagnostics.Process]::Start($startInfo)
         # scrcpy가 즉시 종료돼도 실제 오류 메시지를 진단 기록에 남긴다.
         $script:MirrorStdOutTask = $script:MirrorProcess.StandardOutput.ReadToEndAsync()
@@ -229,6 +261,9 @@ function Start-Mirror {
         $PrimaryButton.IsEnabled = $false
         $StopButton.Visibility = 'Visible'
         Add-DiagnosticLine "미러링 시작: $($Device.Model) / $($Device.Serial)"
+        # 수업 중에는 관리 창을 숨겨 실제로 보이는 창을 미러 화면 하나로 유지합니다.
+        $script:WindowHiddenForMirror = $true
+        $window.Hide()
     }
     catch {
         Add-DiagnosticLine "미러링 실행 실패: $($_.Exception.Message)"
@@ -262,18 +297,16 @@ function Add-MirrorExitDiagnostics {
 
 function Stop-Mirror {
     $AutoConnectCheck.IsChecked = $false
+    $script:MirrorStopRequested = $true
     if ($script:MirrorProcess -and -not $script:MirrorProcess.HasExited) {
-        try { $script:MirrorProcess.CloseMainWindow() | Out-Null } catch { }
-        Start-Sleep -Milliseconds 250
-        if (-not $script:MirrorProcess.HasExited) {
-            try { $script:MirrorProcess.Kill() } catch { }
-        }
+        Stop-ProcessTree -Process $script:MirrorProcess
         try { $script:MirrorProcess.WaitForExit(2000) | Out-Null } catch { }
         if ($script:MirrorProcess.HasExited) { Add-MirrorExitDiagnostics -Process $script:MirrorProcess }
         Add-DiagnosticLine '미러링 종료'
     }
     $script:MirrorProcess = $null
     $StopButton.Visibility = 'Collapsed'
+    Restore-ControlWindow
     Update-ConnectionState -AllowAutoStart:$false
 }
 
@@ -290,10 +323,20 @@ function Update-ConnectionState {
     if ($script:IsClosing) { return }
     if ($script:MirrorProcess -and -not $script:MirrorProcess.HasExited) { return }
     if ($script:MirrorProcess -and $script:MirrorProcess.HasExited) {
+        $wasStopRequested = $script:MirrorStopRequested
         Add-MirrorExitDiagnostics -Process $script:MirrorProcess
         $script:MirrorProcess = $null
+        $script:MirrorStopRequested = $false
         $StopButton.Visibility = 'Collapsed'
-        Add-DiagnosticLine '미러링 창이 닫혔습니다. 기록을 확인한 뒤 화면 연결을 다시 눌러 주세요.'
+        Restore-ControlWindow
+        if ($wasStopRequested) {
+            Add-DiagnosticLine '미러링이 종료되었습니다.'
+        }
+        else {
+            # 영상 창의 X를 누른 뒤 같은 기기가 즉시 다시 뜨는 재시작 루프를 막습니다.
+            $AutoConnectCheck.IsChecked = $false
+            Add-DiagnosticLine '미러링 창이 닫혔습니다. 필요하면 화면 연결을 다시 눌러 주세요.'
+        }
     }
 
     $state = Get-ConnectionState
@@ -393,8 +436,8 @@ function Show-SetupGuide {
       <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="12"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
       <StackPanel>
         <CheckBox x:Name="AutoConnectCheck" Content="케이블 연결 시 자동 시작" IsChecked="True"/>
-        <CheckBox x:Name="FullscreenCheck" Content="TV 전체 화면으로 열기" IsChecked="True" Margin="0,12,0,0"/>
-        <TextBlock Text="화면 조작은 주강사의 태블릿에서만 가능합니다." Margin="0,12,0,0" FontSize="12" Foreground="#6B7280"/>
+        <CheckBox x:Name="FullscreenCheck" Content="TV 전체 화면으로 열기" IsChecked="False" Margin="0,12,0,0"/>
+        <TextBlock Text="미러 창의 X를 누르면 즉시 연결이 끝납니다. 화면 조작은 태블릿에서만 가능합니다." Margin="0,12,0,0" FontSize="12" Foreground="#6B7280" TextWrapping="Wrap"/>
       </StackPanel>
       <StackPanel Grid.Column="2" Width="150">
         <TextBlock Text="화질" FontSize="13" Foreground="#4B5563" Margin="0,0,0,5"/>
@@ -477,7 +520,7 @@ $window.Add_Closing({
     $script:IsClosing = $true
     $timer.Stop()
     if ($script:MirrorProcess -and -not $script:MirrorProcess.HasExited) {
-        try { $script:MirrorProcess.Kill() } catch { }
+        Stop-ProcessTree -Process $script:MirrorProcess
     }
 })
 
