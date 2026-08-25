@@ -12,99 +12,74 @@ $script:ScrcpyPath = Join-Path $script:EnginePath 'scrcpy.exe'
 $script:MirrorProcess = $null
 $script:MirrorStdOutTask = $null
 $script:MirrorStdErrTask = $null
-$script:LastDeviceSerial = ''
 $script:LastAutoStartSerial = ''
-$script:LastStatusKey = ''
 $script:IsClosing = $false
-$script:MirrorStopRequested = $false
-$script:WindowHiddenForMirror = $false
+$script:LogPath = Join-Path $env:LOCALAPPDATA 'GomdoryMirror\gomdory-mirror.log'
 
-function ConvertTo-XamlSafeText {
-    param([AllowNull()][string]$Text)
-    if ($null -eq $Text) { return '' }
-    return [System.Security.SecurityElement]::Escape($Text)
+function Write-AppLog {
+    param([string]$Message)
+    try {
+        $directory = Split-Path -Parent $script:LogPath
+        if (-not (Test-Path -LiteralPath $directory)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
+        [System.IO.File]::AppendAllText($script:LogPath, "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message`r`n", [System.Text.UTF8Encoding]::new($false))
+    }
+    catch { }
+}
+
+function Add-DiagnosticLine {
+    param([string]$Message)
+    Write-AppLog $Message
+    if ($null -ne $DiagnosticBox) {
+        $DiagnosticBox.AppendText("[$(Get-Date -Format 'HH:mm:ss')] $Message`r`n")
+        $DiagnosticBox.ScrollToEnd()
+    }
+}
+
+function Join-ProcessArguments {
+    param([string[]]$Arguments)
+    return (($Arguments | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' ')
 }
 
 function Invoke-Adb {
-    param(
-        [string[]]$Arguments,
-        [int]$TimeoutMilliseconds = 8000
-    )
-
+    param([string[]]$Arguments, [int]$TimeoutMilliseconds = 3500)
     if (-not (Test-Path -LiteralPath $script:AdbPath)) {
-        return [pscustomobject]@{ ExitCode = 127; Output = ''; Error = 'ADB 실행 파일 없음' }
+        return [pscustomobject]@{ ExitCode = 127; Output = ''; Error = 'ADB 실행 파일이 없습니다.' }
     }
-
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $script:AdbPath
-    $startInfo.Arguments = ($Arguments | ForEach-Object {
-        if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
-    }) -join ' '
+    $startInfo.Arguments = Join-ProcessArguments -Arguments $Arguments
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
-
     $process = $null
     try {
         $process = [System.Diagnostics.Process]::Start($startInfo)
-        # 파이프를 먼저 비워야 ADB가 출력 버퍼를 기다리며 멈추지 않는다.
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit($TimeoutMilliseconds)) {
-            try {
-                $process.Kill()
-                $process.WaitForExit()
-            }
-            catch { }
-            return [pscustomobject]@{
-                ExitCode = 124
-                Output = ''
-                Error = "ADB 응답 시간 초과 ($TimeoutMilliseconds ms)"
-            }
+            try { $process.Kill(); $process.WaitForExit() } catch { }
+            return [pscustomobject]@{ ExitCode = 124; Output = ''; Error = '태블릿 연결 확인 시간이 초과되었습니다.' }
         }
-        return [pscustomobject]@{
-            ExitCode = $process.ExitCode
-            Output = $stdoutTask.Result.Trim()
-            Error = $stderrTask.Result.Trim()
-        }
+        return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = $stdout.Result.Trim(); Error = $stderr.Result.Trim() }
     }
-    catch {
-        return [pscustomobject]@{ ExitCode = 1; Output = ''; Error = $_.Exception.Message }
-    }
-    finally {
-        if ($null -ne $process) { $process.Dispose() }
-    }
+    catch { return [pscustomobject]@{ ExitCode = 1; Output = ''; Error = $_.Exception.Message } }
+    finally { if ($null -ne $process) { $process.Dispose() } }
 }
 
 function Get-AndroidDevices {
     $result = Invoke-Adb -Arguments @('devices', '-l')
     if ($result.ExitCode -ne 0) {
-        $message = @($result.Error, $result.Output) |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-        if ($message.Count -eq 0) { $message = @("ADB 종료 코드 $($result.ExitCode)") }
+        $message = @($result.Error, $result.Output) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
         return [pscustomobject]@{ Error = ($message -join ' / '); Devices = @() }
     }
-
     $devices = @()
     foreach ($line in ($result.Output -split "`r?`n")) {
-        if ([string]::IsNullOrWhiteSpace($line) -or $line -like 'List of devices*' -or $line -like '*daemon*') {
-            continue
-        }
+        if ([string]::IsNullOrWhiteSpace($line) -or $line -like 'List of devices*' -or $line -like '*daemon*') { continue }
         if ($line -match '^([^\s]+)\s+([^\s]+)(?:\s+(.*))?$') {
-            $serial = $Matches[1]
-            $state = $Matches[2]
-            $details = $Matches[3]
             $model = ''
-            if ($details -match '(?:^|\s)model:([^\s]+)') {
-                $model = $Matches[1] -replace '_', ' '
-            }
-            $devices += [pscustomobject]@{
-                Serial = $serial
-                State = $state
-                Model = $model
-                Details = $details
-            }
+            if ($Matches[3] -match '(?:^|\s)model:([^\s]+)') { $model = $Matches[1] -replace '_', ' ' }
+            $devices += [pscustomobject]@{ Serial = $Matches[1]; State = $Matches[2]; Model = $model }
         }
     }
     return [pscustomobject]@{ Error = ''; Devices = @($devices) }
@@ -112,233 +87,154 @@ function Get-AndroidDevices {
 
 function Get-ConnectionState {
     if (-not (Test-Path -LiteralPath $script:ScrcpyPath) -or -not (Test-Path -LiteralPath $script:AdbPath)) {
-        return [pscustomobject]@{
-            Key = 'engine-missing'; Title = '실행 엔진을 찾을 수 없습니다';
-            Detail = '배포용 ZIP을 다시 내려받아 압축을 완전히 풀어 주세요.';
-            Color = '#B91C1C'; Action = '배포 파일 확인'; Device = $null
-        }
+        return [pscustomobject]@{ Key = 'engine-missing'; Title = '실행 파일을 찾지 못했습니다'; Detail = 'ZIP을 완전히 푼 뒤 폴더 안의 “곰도리 미러 시작.cmd”를 실행해 주세요.'; Color = '#B91C1C'; Action = '연결 방법'; Device = $null }
     }
-
     $scan = Get-AndroidDevices
     if (-not [string]::IsNullOrWhiteSpace($scan.Error)) {
-        return [pscustomobject]@{
-            Key = 'adb-error'; Title = 'USB 연결을 확인하지 못했습니다';
-            Detail = '케이블을 다시 꽂은 뒤 다시 확인해 주세요. 계속되면 진단 기록을 복사해 주세요.';
-            Color = '#B91C1C'; Action = '다시 확인'; Device = $null; Diagnostic = $scan.Error
-        }
+        return [pscustomobject]@{ Key = 'adb-error'; Title = '태블릿 연결을 확인하지 못했습니다'; Detail = '케이블을 다시 연결한 뒤 “다시 확인”을 누르세요.'; Color = '#B91C1C'; Action = '다시 확인'; Device = $null; Diagnostic = $scan.Error }
     }
-
-    $all = @($scan.Devices)
-    if ($all.Count -eq 0) {
-        return [pscustomobject]@{
-            Key = 'no-device'; Title = '태블릿 연결을 기다리고 있습니다';
-            Detail = '데이터 전송이 가능한 USB 케이블로 태블릿을 연결해 주세요.';
-            Color = '#6B7280'; Action = '연결 방법 보기'; Device = $null
-        }
+    $ready = @($scan.Devices | Where-Object { $_.State -eq 'device' })
+    $unauthorized = @($scan.Devices | Where-Object { $_.State -eq 'unauthorized' })
+    $offline = @($scan.Devices | Where-Object { $_.State -eq 'offline' })
+    if ($ready.Count -gt 1) {
+        return [pscustomobject]@{ Key = 'multiple'; Title = '태블릿이 여러 대 연결되어 있습니다'; Detail = '수업에 쓸 태블릿 하나만 남기고 다른 Android 기기의 USB 케이블을 빼 주세요.'; Color = '#B45309'; Action = '다시 확인'; Device = $null }
     }
-
-    $authorized = @($all | Where-Object { $_.State -eq 'device' })
-    $unauthorized = @($all | Where-Object { $_.State -eq 'unauthorized' })
-    $offline = @($all | Where-Object { $_.State -eq 'offline' })
-
-    if ($authorized.Count -gt 1) {
-        return [pscustomobject]@{
-            Key = 'multiple'; Title = 'Android 기기가 여러 대 연결되어 있습니다';
-            Detail = '수업에 사용할 태블릿 한 대만 남기고 다른 기기의 USB 케이블을 빼 주세요.';
-            Color = '#B45309'; Action = '다시 확인'; Device = $null
-        }
-    }
-    if ($authorized.Count -eq 1) {
-        $device = $authorized[0]
-        $name = if ([string]::IsNullOrWhiteSpace($device.Model)) { 'Android 태블릿' } else { $device.Model }
-        return [pscustomobject]@{
-            Key = 'ready'; Title = "$name 연결 준비 완료";
-            Detail = '주강사는 태블릿을 그대로 조작하세요. 이 노트북은 화면만 TV로 전달합니다.';
-            Color = '#15803D'; Action = '화면 연결'; Device = $device
-        }
+    if ($ready.Count -eq 1) {
+        $device = $ready[0]
+        $name = if ([string]::IsNullOrWhiteSpace($device.Model)) { '태블릿' } else { $device.Model }
+        return [pscustomobject]@{ Key = 'ready'; Title = "$name 연결 완료"; Detail = '이제 “화면 열기”를 누르세요. 주강사는 태블릿을 직접 조작합니다.'; Color = '#15803D'; Action = '화면 열기'; Device = $device }
     }
     if ($unauthorized.Count -gt 0) {
-        return [pscustomobject]@{
-            Key = 'unauthorized'; Title = '태블릿에서 연결을 허용해 주세요';
-            Detail = '태블릿 잠금을 풀고 “이 컴퓨터에서 항상 허용”을 선택한 뒤 허용을 누르세요.';
-            Color = '#B45309'; Action = '승인 후 다시 확인'; Device = $unauthorized[0]
-        }
+        return [pscustomobject]@{ Key = 'unauthorized'; Title = '태블릿에서 USB 디버깅을 허용해 주세요'; Detail = '태블릿 잠금을 풀고 “이 컴퓨터에서 항상 허용”을 체크한 뒤 허용을 누르세요.'; Color = '#B45309'; Action = '허용 후 다시 확인'; Device = $unauthorized[0] }
     }
     if ($offline.Count -gt 0) {
-        return [pscustomobject]@{
-            Key = 'offline'; Title = '태블릿이 응답하지 않습니다';
-            Detail = '태블릿 잠금을 해제하고 케이블을 한 번 뺐다가 다시 연결해 주세요.';
-            Color = '#B45309'; Action = '다시 확인'; Device = $offline[0]
-        }
+        return [pscustomobject]@{ Key = 'offline'; Title = '태블릿이 응답하지 않습니다'; Detail = '태블릿 잠금을 해제하고 케이블을 한 번 뺐다가 다시 연결해 주세요.'; Color = '#B45309'; Action = '다시 확인'; Device = $offline[0] }
     }
-    return [pscustomobject]@{
-        Key = 'unsupported-state'; Title = '태블릿 연결 상태를 확인해 주세요';
-        Detail = 'USB 모드를 파일 전송으로 바꾸고 USB 디버깅이 켜져 있는지 확인하세요.';
-        Color = '#B45309'; Action = '다시 확인'; Device = $all[0]
-    }
+    return [pscustomobject]@{ Key = 'no-device'; Title = '태블릿을 연결해 주세요'; Detail = '데이터 전송이 가능한 USB 케이블을 연결하고, 처음이면 USB 디버깅을 허용해 주세요.'; Color = '#6B7280'; Action = '연결 방법'; Device = $null }
 }
 
 function Get-QualityArguments {
-    param([string]$Quality)
-    switch ($Quality) {
-        '선명하게' { return @('--max-size=2560', '--video-bit-rate=12M', '--max-fps=30') }
+    switch ([string]$QualityCombo.SelectedItem.Content) {
         '빠르게' { return @('--max-size=1280', '--video-bit-rate=4M', '--max-fps=30') }
+        '선명하게' { return @('--max-size=2560', '--video-bit-rate=12M', '--max-fps=30') }
         default { return @('--max-size=1920', '--video-bit-rate=8M', '--max-fps=30') }
     }
+}
+
+function Stop-ProcessTree {
+    param([System.Diagnostics.Process]$Process)
+    if ($null -eq $Process) { return }
+    try { $Process.Refresh() } catch { return }
+    if ($Process.HasExited) { return }
+    try { $Process.CloseMainWindow() | Out-Null } catch { }
+    if ($Process.WaitForExit(1000)) { return }
+    try {
+        $taskKill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+        $killer = Start-Process -FilePath $taskKill -ArgumentList @('/PID', "$($Process.Id)", '/T', '/F') -NoNewWindow -PassThru
+        $killer.WaitForExit(3000) | Out-Null
+    }
+    catch { try { $Process.Kill() } catch { } }
 }
 
 function Restore-ControlWindow {
     if ($script:IsClosing) { return }
     if (-not $window.IsVisible) { $window.Show() }
     $window.Activate()
-    $script:WindowHiddenForMirror = $false
-}
-
-function Stop-ProcessTree {
-    param([System.Diagnostics.Process]$Process)
-
-    if ($null -eq $Process) { return }
-    try { $Process.Refresh() } catch { return }
-    if ($Process.HasExited) { return }
-
-    try { $Process.CloseMainWindow() | Out-Null } catch { }
-    if ($Process.WaitForExit(900)) { return }
-
-    # scrcpy가 남긴 자식 프로세스까지 함께 끝내서 다음 연결에 영향을 주지 않게 합니다.
-    $taskKill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
-    try {
-        $kill = Start-Process -FilePath $taskKill -ArgumentList @('/PID', "$($Process.Id)", '/T', '/F') -NoNewWindow -PassThru
-        $kill.WaitForExit(3000) | Out-Null
-    }
-    catch {
-        try { $Process.Kill() } catch { }
-    }
-}
-
-function Start-Mirror {
-    param($Device)
-
-    if ($null -eq $Device) { return }
-    if ($script:MirrorProcess -and -not $script:MirrorProcess.HasExited) {
-        $script:MirrorProcess.Refresh()
-        return
-    }
-
-    $arguments = @(
-        "--serial=$($Device.Serial)",
-        '--window-title=곰도리 미러',
-        '--stay-awake',
-        '--disable-screensaver',
-        '--no-control',
-        '--no-audio'
-    )
-    $arguments += Get-QualityArguments -Quality ([string]$QualityCombo.SelectedItem.Content)
-    if ($FullscreenCheck.IsChecked) { $arguments += '--fullscreen' }
-
-    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $script:ScrcpyPath
-    $startInfo.WorkingDirectory = $script:EnginePath
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    $startInfo.Arguments = ($arguments | ForEach-Object {
-        if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
-    }) -join ' '
-
-    try {
-        $script:MirrorStopRequested = $false
-        $script:MirrorProcess = [System.Diagnostics.Process]::Start($startInfo)
-        # scrcpy가 즉시 종료돼도 실제 오류 메시지를 진단 기록에 남긴다.
-        $script:MirrorStdOutTask = $script:MirrorProcess.StandardOutput.ReadToEndAsync()
-        $script:MirrorStdErrTask = $script:MirrorProcess.StandardError.ReadToEndAsync()
-        $script:LastDeviceSerial = $Device.Serial
-        $script:LastAutoStartSerial = $Device.Serial
-        $StatusTitle.Text = '수업 화면을 전송하고 있습니다'
-        $StatusDetail.Text = '주강사는 태블릿을 직접 조작하세요. 연결을 끝내려면 아래 버튼을 누르세요.'
-        $StatusDot.Fill = '#15803D'
-        $PrimaryButton.Content = '연결됨'
-        $PrimaryButton.IsEnabled = $false
-        $StopButton.Visibility = 'Visible'
-        Add-DiagnosticLine "미러링 시작: $($Device.Model) / $($Device.Serial)"
-        # 수업 중에는 관리 창을 숨겨 실제로 보이는 창을 미러 화면 하나로 유지합니다.
-        $script:WindowHiddenForMirror = $true
-        $window.Hide()
-    }
-    catch {
-        Add-DiagnosticLine "미러링 실행 실패: $($_.Exception.Message)"
-        [System.Windows.MessageBox]::Show(
-            '미러링을 시작하지 못했습니다. 진단 기록을 복사해 확인해 주세요.',
-            '곰도리 미러', 'OK', 'Error'
-        ) | Out-Null
-    }
 }
 
 function Add-MirrorExitDiagnostics {
     param([System.Diagnostics.Process]$Process)
-
     if ($null -eq $Process) { return }
-    $exitCode = $Process.ExitCode
-    $lines = [System.Collections.Generic.List[string]]::new()
+    Add-DiagnosticLine "화면 전송이 끝났습니다. (종료 코드: $($Process.ExitCode))"
     foreach ($task in @($script:MirrorStdOutTask, $script:MirrorStdErrTask)) {
         if ($null -eq $task) { continue }
         try {
-            foreach ($line in ($task.Result -split "`r?`n")) {
-                if (-not [string]::IsNullOrWhiteSpace($line)) { $lines.Add($line.Trim()) }
-            }
+            ($task.Result -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 8) | ForEach-Object { Add-DiagnosticLine "scrcpy: $($_.Trim())" }
         }
-        catch { $lines.Add("출력 확인 실패: $($_.Exception.Message)") }
+        catch { Add-DiagnosticLine "scrcpy 기록을 읽지 못했습니다: $($_.Exception.Message)" }
     }
-    Add-DiagnosticLine "scrcpy 종료 코드: $exitCode"
-    $lines | Select-Object -Last 12 | ForEach-Object { Add-DiagnosticLine "scrcpy: $_" }
     $script:MirrorStdOutTask = $null
     $script:MirrorStdErrTask = $null
 }
 
+function WaitForMirrorWindow {
+    param([System.Diagnostics.Process]$Process)
+    for ($i = 0; $i -lt 12; $i++) {
+        Start-Sleep -Milliseconds 150
+        try {
+            $Process.Refresh()
+            if ($Process.HasExited) { return $false }
+            if ($Process.MainWindowHandle -ne [IntPtr]::Zero) { return $true }
+        }
+        catch { return $false }
+    }
+    return -not $Process.HasExited
+}
+
+function Start-Mirror {
+    param($Device)
+    if ($null -eq $Device) { return }
+    if ($script:MirrorProcess -and -not $script:MirrorProcess.HasExited) { return }
+    $arguments = @("--serial=$($Device.Serial)", '--window-title=곰도리 미러', '--no-control', '--no-audio', '--stay-awake', '--disable-screensaver')
+    $arguments += Get-QualityArguments
+    if ($FullscreenCheck.IsChecked) { $arguments += '--fullscreen' }
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $script:ScrcpyPath
+    $startInfo.WorkingDirectory = $script:EnginePath
+    $startInfo.Arguments = Join-ProcessArguments -Arguments $arguments
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    try {
+        $script:MirrorProcess = [System.Diagnostics.Process]::Start($startInfo)
+        $script:MirrorStdOutTask = $script:MirrorProcess.StandardOutput.ReadToEndAsync()
+        $script:MirrorStdErrTask = $script:MirrorProcess.StandardError.ReadToEndAsync()
+        $script:LastAutoStartSerial = $Device.Serial
+        $StatusTitle.Text = '화면을 열고 있습니다'
+        $StatusDetail.Text = '화면 창이 준비되면 이 창은 자동으로 숨겨집니다.'
+        $StatusDot.Fill = '#15803D'
+        $PrimaryButton.IsEnabled = $false
+        $StopButton.Visibility = 'Visible'
+        Add-DiagnosticLine "화면 전송 시작: $($Device.Model)"
+        if (WaitForMirrorWindow -Process $script:MirrorProcess) {
+            # ShowDialog()가 아닌 일반 창이므로 Hide() 뒤에도 앱이 종료되지 않습니다.
+            $window.Hide()
+        }
+    }
+    catch {
+        $script:MirrorProcess = $null
+        Add-DiagnosticLine "화면 전송을 시작하지 못했습니다: $($_.Exception.Message)"
+        [System.Windows.MessageBox]::Show('화면을 열지 못했습니다. “기록 복사”를 눌러 기록을 보내 주세요.', '곰도리 미러', 'OK', 'Error') | Out-Null
+    }
+}
+
 function Stop-Mirror {
     $AutoConnectCheck.IsChecked = $false
-    $script:MirrorStopRequested = $true
     if ($script:MirrorProcess -and -not $script:MirrorProcess.HasExited) {
         Stop-ProcessTree -Process $script:MirrorProcess
         try { $script:MirrorProcess.WaitForExit(2000) | Out-Null } catch { }
         if ($script:MirrorProcess.HasExited) { Add-MirrorExitDiagnostics -Process $script:MirrorProcess }
-        Add-DiagnosticLine '미러링 종료'
     }
     $script:MirrorProcess = $null
     $StopButton.Visibility = 'Collapsed'
     Restore-ControlWindow
-    Update-ConnectionState -AllowAutoStart:$false
+    Refresh-Connection -AllowAutoStart:$false
 }
 
-function Add-DiagnosticLine {
-    param([string]$Message)
-    $timestamp = Get-Date -Format 'HH:mm:ss'
-    $DiagnosticBox.AppendText("[$timestamp] $Message`r`n")
-    $DiagnosticBox.ScrollToEnd()
-}
-
-function Update-ConnectionState {
+function Refresh-Connection {
     param([bool]$AllowAutoStart = $true)
-
     if ($script:IsClosing) { return }
-    if ($script:MirrorProcess -and -not $script:MirrorProcess.HasExited) { return }
-    if ($script:MirrorProcess -and $script:MirrorProcess.HasExited) {
-        $wasStopRequested = $script:MirrorStopRequested
+    if ($script:MirrorProcess) {
+        try { $script:MirrorProcess.Refresh() } catch { }
+        if (-not $script:MirrorProcess.HasExited) { return }
         Add-MirrorExitDiagnostics -Process $script:MirrorProcess
         $script:MirrorProcess = $null
-        $script:MirrorStopRequested = $false
         $StopButton.Visibility = 'Collapsed'
         Restore-ControlWindow
-        if ($wasStopRequested) {
-            Add-DiagnosticLine '미러링이 종료되었습니다.'
-        }
-        else {
-            # 영상 창의 X를 누른 뒤 같은 기기가 즉시 다시 뜨는 재시작 루프를 막습니다.
-            $AutoConnectCheck.IsChecked = $false
-            Add-DiagnosticLine '미러링 창이 닫혔습니다. 필요하면 화면 연결을 다시 눌러 주세요.'
-        }
+        $AutoConnectCheck.IsChecked = $false
+        Add-DiagnosticLine '미러 창이 닫혔습니다. 필요하면 “화면 열기”를 다시 누르세요.'
     }
-
     $state = Get-ConnectionState
     $StatusTitle.Text = $state.Title
     $StatusDetail.Text = $state.Detail
@@ -346,182 +242,53 @@ function Update-ConnectionState {
     $PrimaryButton.Content = $state.Action
     $PrimaryButton.Tag = $state
     $PrimaryButton.IsEnabled = $true
-
-    if ($state.Key -ne $script:LastStatusKey) {
-        Add-DiagnosticLine "상태: $($state.Key)"
-        $diagnosticProperty = $state.PSObject.Properties['Diagnostic']
-        if ($null -ne $diagnosticProperty) { Add-DiagnosticLine "ADB 오류: $($diagnosticProperty.Value)" }
-        $script:LastStatusKey = $state.Key
-    }
-
+    $diagnostic = $state.PSObject.Properties['Diagnostic']
+    if ($null -ne $diagnostic) { Add-DiagnosticLine "ADB: $($diagnostic.Value)" }
     if ($state.Key -ne 'ready') { $script:LastAutoStartSerial = '' }
-    if ($state.Key -eq 'ready' -and $AutoConnectCheck.IsChecked -and $AllowAutoStart -and
-        $script:LastAutoStartSerial -ne $state.Device.Serial) {
-        Start-Mirror -Device $state.Device
-    }
+    if ($state.Key -eq 'ready' -and $AutoConnectCheck.IsChecked -and $AllowAutoStart -and $script:LastAutoStartSerial -ne $state.Device.Serial) { Start-Mirror -Device $state.Device }
 }
 
 function Show-SetupGuide {
-    $guide = @'
+    [System.Windows.MessageBox]::Show(@'
 처음 한 번만 태블릿에서 설정합니다.
 
-1. 설정 → 태블릿 정보 → 소프트웨어 정보
-2. 빌드번호를 빠르게 7번 누르기
-3. 설정 → 개발자 옵션 → USB 디버깅 켜기
-4. 데이터 전송용 USB 케이블로 노트북 연결
-5. 태블릿에서 “이 컴퓨터에서 항상 허용” 선택
+1. 설정 → 태블릿 정보 → 소프트웨어 정보 → 빌드번호 7번 누르기
+2. 설정 → 개발자 옵션 → USB 디버깅 켜기
+3. 데이터 전송용 USB 케이블로 노트북 연결
+4. 태블릿에 뜨는 “이 컴퓨터에서 항상 허용”을 체크하고 허용
 
-※ 충전 전용 케이블은 사용할 수 없습니다.
-※ 학교에서 관리하는 태블릿은 개발자 옵션이 차단될 수 있습니다.
-'@
-    [System.Windows.MessageBox]::Show($guide, '처음 연결하는 방법', 'OK', 'Information') | Out-Null
+연결이 안 되면 충전 전용 케이블인지 먼저 확인해 주세요.
+'@, '처음 연결하는 방법', 'OK', 'Information') | Out-Null
 }
 
 [xml]$xaml = @'
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="곰도리 미러" Width="760" Height="650" MinWidth="680" MinHeight="600"
-        WindowStartupLocation="CenterScreen" Background="#F7F5F0" FontFamily="Malgun Gothic">
-  <Window.Resources>
-    <Style TargetType="Button">
-      <Setter Property="FontSize" Value="15"/>
-      <Setter Property="FontWeight" Value="SemiBold"/>
-      <Setter Property="Padding" Value="18,11"/>
-      <Setter Property="Cursor" Value="Hand"/>
-      <Setter Property="BorderThickness" Value="0"/>
-      <Setter Property="Background" Value="#274C43"/>
-      <Setter Property="Foreground" Value="White"/>
-    </Style>
-    <Style TargetType="CheckBox">
-      <Setter Property="FontSize" Value="14"/>
-      <Setter Property="Foreground" Value="#374151"/>
-      <Setter Property="VerticalAlignment" Value="Center"/>
-    </Style>
-  </Window.Resources>
-  <Grid Margin="34,28,34,24">
-    <Grid.RowDefinitions>
-      <RowDefinition Height="Auto"/>
-      <RowDefinition Height="18"/>
-      <RowDefinition Height="Auto"/>
-      <RowDefinition Height="18"/>
-      <RowDefinition Height="Auto"/>
-      <RowDefinition Height="16"/>
-      <RowDefinition Height="*"/>
-      <RowDefinition Height="Auto"/>
-    </Grid.RowDefinitions>
-
-    <Grid Grid.Row="0">
-      <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-      <StackPanel>
-        <TextBlock Text="곰도리 미러" FontSize="30" FontWeight="Bold" Foreground="#1F3A35"/>
-        <TextBlock Text="케이블로 태블릿 화면을 TV에 안정적으로" Margin="0,6,0,0" FontSize="15" Foreground="#66736F"/>
-      </StackPanel>
-      <Border Grid.Column="1" Background="#E6EFEA" Padding="10,6" VerticalAlignment="Top">
-        <TextBlock Text="PORTABLE 0.1" FontSize="12" FontWeight="Bold" Foreground="#315E52"/>
-      </Border>
-    </Grid>
-
-    <Border Grid.Row="2" Background="White" BorderBrush="#DDD8CE" BorderThickness="1" Padding="24">
-      <Grid>
-        <Grid.ColumnDefinitions><ColumnDefinition Width="24"/><ColumnDefinition Width="14"/><ColumnDefinition/></Grid.ColumnDefinitions>
-        <Ellipse x:Name="StatusDot" Width="18" Height="18" Fill="#6B7280" VerticalAlignment="Top" Margin="0,4,0,0"/>
-        <StackPanel Grid.Column="2">
-          <TextBlock x:Name="StatusTitle" Text="연결 상태를 확인하고 있습니다" FontSize="20" FontWeight="Bold" Foreground="#1F2937"/>
-          <TextBlock x:Name="StatusDetail" Text="잠시만 기다려 주세요." Margin="0,9,0,0" FontSize="14" Foreground="#4B5563" TextWrapping="Wrap" LineHeight="22"/>
-        </StackPanel>
-      </Grid>
-    </Border>
-
-    <Grid Grid.Row="4">
-      <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="12"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-      <StackPanel>
-        <CheckBox x:Name="AutoConnectCheck" Content="케이블 연결 시 자동 시작" IsChecked="True"/>
-        <CheckBox x:Name="FullscreenCheck" Content="TV 전체 화면으로 열기" IsChecked="False" Margin="0,12,0,0"/>
-        <TextBlock Text="미러 창의 X를 누르면 즉시 연결이 끝납니다. 화면 조작은 태블릿에서만 가능합니다." Margin="0,12,0,0" FontSize="12" Foreground="#6B7280" TextWrapping="Wrap"/>
-      </StackPanel>
-      <StackPanel Grid.Column="2" Width="150">
-        <TextBlock Text="화질" FontSize="13" Foreground="#4B5563" Margin="0,0,0,5"/>
-        <ComboBox x:Name="QualityCombo" SelectedIndex="1" FontSize="14" Padding="8,6">
-          <ComboBoxItem Content="빠르게"/>
-          <ComboBoxItem Content="균형 있게"/>
-          <ComboBoxItem Content="선명하게"/>
-        </ComboBox>
-      </StackPanel>
-    </Grid>
-
-    <Border Grid.Row="6" Background="#EFECE5" Padding="16" BorderBrush="#DDD8CE" BorderThickness="1">
-      <Grid>
-        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
-        <TextBlock Text="현장 진단 기록" FontSize="13" FontWeight="Bold" Foreground="#4B5563"/>
-        <TextBox x:Name="DiagnosticBox" Grid.Row="1" Margin="0,9,0,9" IsReadOnly="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
-                 Background="#FAF9F6" BorderBrush="#D6D1C8" FontFamily="Consolas" FontSize="11" Foreground="#374151" Padding="8"/>
-        <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right">
-          <Button x:Name="GuideButton" Content="처음 연결하는 방법" Background="#6B7280" Padding="12,7" FontSize="12"/>
-          <Button x:Name="DriverButton" Content="Samsung USB 드라이버" Background="#6B7280" Padding="12,7" FontSize="12" Margin="8,0,0,0"/>
-          <Button x:Name="CopyLogButton" Content="기록 복사" Background="#6B7280" Padding="12,7" FontSize="12" Margin="8,0,0,0"/>
-        </StackPanel>
-      </Grid>
-    </Border>
-
-    <Grid Grid.Row="7" Margin="0,18,0,0">
-      <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="12"/><ColumnDefinition/></Grid.ColumnDefinitions>
-      <Button x:Name="StopButton" Content="연결 끊기" Background="#9F3A38" Visibility="Collapsed"/>
-      <Button x:Name="PrimaryButton" Grid.Column="2" Content="다시 확인"/>
-    </Grid>
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="곰도리 미러" Width="620" Height="500" MinWidth="580" MinHeight="460" WindowStartupLocation="CenterScreen" Background="#F7F5F0" FontFamily="Malgun Gothic">
+  <Grid Margin="32,28,32,24">
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="18"/><RowDefinition Height="Auto"/><RowDefinition Height="18"/><RowDefinition Height="Auto"/><RowDefinition Height="16"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <StackPanel Grid.Row="0"><TextBlock Text="곰도리 미러" FontSize="30" FontWeight="Bold" Foreground="#1F3A35"/><TextBlock Text="태블릿을 케이블로 연결해 TV에 띄웁니다" Margin="0,6,0,0" FontSize="15" Foreground="#66736F"/></StackPanel>
+    <Border Grid.Row="2" Background="White" BorderBrush="#DDD8CE" BorderThickness="1" Padding="22"><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="22"/><ColumnDefinition Width="14"/><ColumnDefinition/></Grid.ColumnDefinitions><Ellipse x:Name="StatusDot" Width="16" Height="16" Fill="#6B7280" VerticalAlignment="Top" Margin="0,5,0,0"/><StackPanel Grid.Column="2"><TextBlock x:Name="StatusTitle" Text="연결 상태를 확인하고 있습니다" FontSize="20" FontWeight="Bold" Foreground="#1F2937"/><TextBlock x:Name="StatusDetail" Text="잠시만 기다려 주세요." Margin="0,8,0,0" FontSize="14" Foreground="#4B5563" TextWrapping="Wrap" LineHeight="22"/></StackPanel></Grid></Border>
+    <Grid Grid.Row="4"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="18"/><ColumnDefinition Width="150"/></Grid.ColumnDefinitions><StackPanel><CheckBox x:Name="AutoConnectCheck" Content="다음부터 케이블 연결 시 자동으로 화면 열기" IsChecked="False" FontSize="13" Foreground="#374151"/><CheckBox x:Name="FullscreenCheck" Content="TV 전체 화면으로 열기" IsChecked="False" Margin="0,10,0,0" FontSize="13" Foreground="#374151"/><TextBlock Text="기본 창 모드에서는 미러 창의 X 한 번으로 종료합니다." Margin="0,10,0,0" FontSize="12" Foreground="#6B7280"/></StackPanel><StackPanel Grid.Column="2"><TextBlock Text="화질" FontSize="13" Foreground="#4B5563" Margin="0,0,0,5"/><ComboBox x:Name="QualityCombo" SelectedIndex="1" FontSize="14" Padding="8,6"><ComboBoxItem Content="빠르게"/><ComboBoxItem Content="균형 있게"/><ComboBoxItem Content="선명하게"/></ComboBox></StackPanel></Grid>
+    <Expander Grid.Row="6" Header="문제가 있을 때만 열기 · 진단 기록" Foreground="#4B5563" FontSize="13"><Grid Margin="0,10,0,0"><Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions><TextBox x:Name="DiagnosticBox" MinHeight="105" IsReadOnly="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" Background="#FAF9F6" BorderBrush="#D6D1C8" FontFamily="Consolas" FontSize="11" Foreground="#374151" Padding="8"/><StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,8,0,0"><Button x:Name="GuideButton" Content="처음 연결" Background="#6B7280" Foreground="White" Padding="11,6" BorderThickness="0"/><Button x:Name="DriverButton" Content="Samsung 드라이버" Background="#6B7280" Foreground="White" Padding="11,6" BorderThickness="0" Margin="8,0,0,0"/><Button x:Name="CopyLogButton" Content="기록 복사" Background="#6B7280" Foreground="White" Padding="11,6" BorderThickness="0" Margin="8,0,0,0"/></StackPanel></Grid></Expander>
+    <Grid Grid.Row="7" Margin="0,18,0,0"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="12"/><ColumnDefinition/></Grid.ColumnDefinitions><Button x:Name="StopButton" Content="연결 끊기" Background="#9F3A38" Foreground="White" Padding="16,10" BorderThickness="0" Visibility="Collapsed"/><Button x:Name="PrimaryButton" Grid.Column="2" Content="다시 확인" Background="#274C43" Foreground="White" Padding="16,10" BorderThickness="0"/></Grid>
   </Grid>
 </Window>
 '@
 
 $reader = [System.Xml.XmlNodeReader]::new($xaml)
 $window = [Windows.Markup.XamlReader]::Load($reader)
-
-$controlNames = @(
-    'StatusDot', 'StatusTitle', 'StatusDetail', 'AutoConnectCheck', 'FullscreenCheck',
-    'QualityCombo', 'DiagnosticBox', 'GuideButton', 'DriverButton', 'CopyLogButton',
-    'StopButton', 'PrimaryButton'
-)
-foreach ($controlName in $controlNames) {
-    Set-Variable -Name $controlName -Value $window.FindName($controlName) -Scope Script
-}
-
-$PrimaryButton.Add_Click({
-    $state = $PrimaryButton.Tag
-    if ($null -eq $state) { Update-ConnectionState; return }
-    if ($state.Key -eq 'ready') { Start-Mirror -Device $state.Device; return }
-    if ($state.Key -eq 'no-device' -or $state.Key -eq 'engine-missing') { Show-SetupGuide; return }
-    Update-ConnectionState
-})
+foreach ($name in @('StatusDot','StatusTitle','StatusDetail','AutoConnectCheck','FullscreenCheck','QualityCombo','DiagnosticBox','GuideButton','DriverButton','CopyLogButton','StopButton','PrimaryButton')) { Set-Variable -Name $name -Value $window.FindName($name) -Scope Script }
+$PrimaryButton.Add_Click({ $state = $PrimaryButton.Tag; if ($null -eq $state) { Refresh-Connection; return }; if ($state.Key -eq 'ready') { Start-Mirror -Device $state.Device; return }; if ($state.Key -eq 'no-device' -or $state.Key -eq 'engine-missing') { Show-SetupGuide; return }; Refresh-Connection })
 $StopButton.Add_Click({ Stop-Mirror })
 $GuideButton.Add_Click({ Show-SetupGuide })
 $DriverButton.Add_Click({ Start-Process 'https://developer.samsung.com/android-usb-driver' })
-$CopyLogButton.Add_Click({
-    [System.Windows.Clipboard]::SetText($DiagnosticBox.Text)
-    $CopyLogButton.Content = '복사됨'
-})
-
+$CopyLogButton.Add_Click({ [System.Windows.Clipboard]::SetText($DiagnosticBox.Text); $CopyLogButton.Content = '복사됨' })
 $timer = [System.Windows.Threading.DispatcherTimer]::new()
-$timer.Interval = [TimeSpan]::FromSeconds(3)
-$timer.Add_Tick({ Update-ConnectionState })
+$timer.Interval = [TimeSpan]::FromSeconds(2)
+$timer.Add_Tick({ Refresh-Connection })
+$window.Add_ContentRendered({ Add-DiagnosticLine "곰도리 미러 시작 / Windows $([Environment]::OSVersion.Version)"; Refresh-Connection -AllowAutoStart:$false; $timer.Start() })
+$window.Add_Closed({ $script:IsClosing = $true; $timer.Stop(); if ($script:MirrorProcess -and -not $script:MirrorProcess.HasExited) { Stop-ProcessTree -Process $script:MirrorProcess }; $window.Dispatcher.BeginInvokeShutdown([System.Windows.Threading.DispatcherPriority]::Normal) })
+trap { Write-AppLog "치명적 오류: $($_.Exception.Message)"; try { [System.Windows.MessageBox]::Show("프로그램 오류가 기록되었습니다.`r`n$script:LogPath", '곰도리 미러', 'OK', 'Error') | Out-Null } catch { }; exit 1 }
 
-$window.Add_ContentRendered({
-    Add-DiagnosticLine "곰도리 미러 시작 / Windows $([Environment]::OSVersion.Version)"
-    $adbVersion = Invoke-Adb -Arguments @('version')
-    if ($adbVersion.ExitCode -eq 0) {
-        ($adbVersion.Output -split "`r?`n" | Select-Object -First 2) |
-            ForEach-Object { Add-DiagnosticLine $_ }
-    }
-    else {
-        Add-DiagnosticLine "ADB 시작 확인 실패: $($adbVersion.Error)"
-    }
-    Update-ConnectionState
-    $timer.Start()
-})
-$window.Add_Closing({
-    $script:IsClosing = $true
-    $timer.Stop()
-    if ($script:MirrorProcess -and -not $script:MirrorProcess.HasExited) {
-        Stop-ProcessTree -Process $script:MirrorProcess
-    }
-})
-
-$window.ShowDialog() | Out-Null
+# ShowDialog()를 사용하지 않습니다. 창을 숨겨도 메시지 루프가 살아 있어 미러 창이 닫힌 뒤 준비 창으로 안전하게 돌아옵니다.
+$window.Show()
+[System.Windows.Threading.Dispatcher]::Run()
