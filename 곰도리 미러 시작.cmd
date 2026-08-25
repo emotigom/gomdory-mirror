@@ -10,5 +10,9 @@ if errorlevel 1 (
   exit /b 1
 )
 
-start "Gomdory Mirror" powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -STA -File "%~dp0app\GomdoryMirror.ps1"
+set "LOG_DIR=%LOCALAPPDATA%\GomdoryMirror"
+set "LOG_FILE=%LOG_DIR%\startup.log"
+if not exist "%LOG_DIR%" mkdir "%LOG_DIR%" >nul 2>&1
+echo [%date% %time%] Gomdory Mirror start>>"%LOG_FILE%"
+start "Gomdory Mirror" powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -STA -File "%~dp0app\GomdoryMirror.ps1" 1>>"%LOG_FILE%" 2>&1
 exit /b 0

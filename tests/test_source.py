@@ -37,6 +37,9 @@ def main() -> int:
         "AutoConnectCheck",
         "Get-AndroidDevices",
         "Stop-Mirror",
+        "ReadToEndAsync",
+        "Add-MirrorExitDiagnostics",
+        "LastAutoStartSerial",
     ]
     for fragment in required_fragments:
         require(fragment in source, f"필수 기능 누락: {fragment}")

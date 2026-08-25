@@ -34,6 +34,9 @@ Assert-True ($appText.Contains("'--no-control'")) '보기 전용 옵션이 누�
 Assert-True ($appText.Contains("'--fullscreen'")) '전체 화면 옵션이 누락되었습니다.'
 Assert-True ($appText.Contains("'unauthorized'")) 'USB 승인 대기 상태가 누락되었습니다.'
 Assert-True ($appText.Contains('AutoConnectCheck')) '자동 연결 기능이 누락되었습니다.'
+Assert-True ($appText.Contains('ReadToEndAsync')) 'ADB/scrcpy 비동기 출력 처리가 누락되었습니다.'
+Assert-True ($appText.Contains('Add-MirrorExitDiagnostics')) 'scrcpy 종료 진단이 누락되었습니다.'
+Assert-True ($appText.Contains('LastAutoStartSerial')) '자동 재시작 반복 방지가 누락되었습니다.'
 
 if ($failures.Count -gt 0) {
     $failures | ForEach-Object { Write-Error $_ }

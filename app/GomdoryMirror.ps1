@@ -10,7 +10,10 @@ $script:EnginePath = Join-Path $script:RootPath 'tools\scrcpy'
 $script:AdbPath = Join-Path $script:EnginePath 'adb.exe'
 $script:ScrcpyPath = Join-Path $script:EnginePath 'scrcpy.exe'
 $script:MirrorProcess = $null
+$script:MirrorStdOutTask = $null
+$script:MirrorStdErrTask = $null
 $script:LastDeviceSerial = ''
+$script:LastAutoStartSerial = ''
 $script:LastStatusKey = ''
 $script:IsClosing = $false
 
@@ -21,7 +24,10 @@ function ConvertTo-XamlSafeText {
 }
 
 function Invoke-Adb {
-    param([string[]]$Arguments)
+    param(
+        [string[]]$Arguments,
+        [int]$TimeoutMilliseconds = 8000
+    )
 
     if (-not (Test-Path -LiteralPath $script:AdbPath)) {
         return [pscustomobject]@{ ExitCode = 127; Output = ''; Error = 'ADB 실행 파일 없음' }
@@ -37,27 +43,45 @@ function Invoke-Adb {
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
 
+    $process = $null
     try {
         $process = [System.Diagnostics.Process]::Start($startInfo)
-        if (-not $process.WaitForExit(3500)) {
-            try { $process.Kill() } catch { }
-            return [pscustomobject]@{ ExitCode = 124; Output = ''; Error = 'ADB 응답 시간 초과' }
+        # 파이프를 먼저 비워야 ADB가 출력 버퍼를 기다리며 멈추지 않는다.
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+            try {
+                $process.Kill()
+                $process.WaitForExit()
+            }
+            catch { }
+            return [pscustomobject]@{
+                ExitCode = 124
+                Output = ''
+                Error = "ADB 응답 시간 초과 ($TimeoutMilliseconds ms)"
+            }
         }
         return [pscustomobject]@{
             ExitCode = $process.ExitCode
-            Output = $process.StandardOutput.ReadToEnd().Trim()
-            Error = $process.StandardError.ReadToEnd().Trim()
+            Output = $stdoutTask.Result.Trim()
+            Error = $stderrTask.Result.Trim()
         }
     }
     catch {
         return [pscustomobject]@{ ExitCode = 1; Output = ''; Error = $_.Exception.Message }
+    }
+    finally {
+        if ($null -ne $process) { $process.Dispose() }
     }
 }
 
 function Get-AndroidDevices {
     $result = Invoke-Adb -Arguments @('devices', '-l')
     if ($result.ExitCode -ne 0) {
-        return [pscustomobject]@{ Error = $result.Error; Devices = @() }
+        $message = @($result.Error, $result.Output) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        if ($message.Count -eq 0) { $message = @("ADB 종료 코드 $($result.ExitCode)") }
+        return [pscustomobject]@{ Error = ($message -join ' / '); Devices = @() }
     }
 
     $devices = @()
@@ -98,7 +122,7 @@ function Get-ConnectionState {
         return [pscustomobject]@{
             Key = 'adb-error'; Title = 'USB 연결을 확인하지 못했습니다';
             Detail = '케이블을 다시 꽂은 뒤 다시 확인해 주세요. 계속되면 진단 기록을 복사해 주세요.';
-            Color = '#B91C1C'; Action = '다시 확인'; Device = $null
+            Color = '#B91C1C'; Action = '다시 확인'; Device = $null; Diagnostic = $scan.Error
         }
     }
 
@@ -185,13 +209,19 @@ function Start-Mirror {
     $startInfo.WorkingDirectory = $script:EnginePath
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
     $startInfo.Arguments = ($arguments | ForEach-Object {
         if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
     }) -join ' '
 
     try {
         $script:MirrorProcess = [System.Diagnostics.Process]::Start($startInfo)
+        # scrcpy가 즉시 종료돼도 실제 오류 메시지를 진단 기록에 남긴다.
+        $script:MirrorStdOutTask = $script:MirrorProcess.StandardOutput.ReadToEndAsync()
+        $script:MirrorStdErrTask = $script:MirrorProcess.StandardError.ReadToEndAsync()
         $script:LastDeviceSerial = $Device.Serial
+        $script:LastAutoStartSerial = $Device.Serial
         $StatusTitle.Text = '수업 화면을 전송하고 있습니다'
         $StatusDetail.Text = '주강사는 태블릿을 직접 조작하세요. 연결을 끝내려면 아래 버튼을 누르세요.'
         $StatusDot.Fill = '#15803D'
@@ -209,6 +239,27 @@ function Start-Mirror {
     }
 }
 
+function Add-MirrorExitDiagnostics {
+    param([System.Diagnostics.Process]$Process)
+
+    if ($null -eq $Process) { return }
+    $exitCode = $Process.ExitCode
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($task in @($script:MirrorStdOutTask, $script:MirrorStdErrTask)) {
+        if ($null -eq $task) { continue }
+        try {
+            foreach ($line in ($task.Result -split "`r?`n")) {
+                if (-not [string]::IsNullOrWhiteSpace($line)) { $lines.Add($line.Trim()) }
+            }
+        }
+        catch { $lines.Add("출력 확인 실패: $($_.Exception.Message)") }
+    }
+    Add-DiagnosticLine "scrcpy 종료 코드: $exitCode"
+    $lines | Select-Object -Last 12 | ForEach-Object { Add-DiagnosticLine "scrcpy: $_" }
+    $script:MirrorStdOutTask = $null
+    $script:MirrorStdErrTask = $null
+}
+
 function Stop-Mirror {
     $AutoConnectCheck.IsChecked = $false
     if ($script:MirrorProcess -and -not $script:MirrorProcess.HasExited) {
@@ -217,6 +268,8 @@ function Stop-Mirror {
         if (-not $script:MirrorProcess.HasExited) {
             try { $script:MirrorProcess.Kill() } catch { }
         }
+        try { $script:MirrorProcess.WaitForExit(2000) | Out-Null } catch { }
+        if ($script:MirrorProcess.HasExited) { Add-MirrorExitDiagnostics -Process $script:MirrorProcess }
         Add-DiagnosticLine '미러링 종료'
     }
     $script:MirrorProcess = $null
@@ -237,9 +290,10 @@ function Update-ConnectionState {
     if ($script:IsClosing) { return }
     if ($script:MirrorProcess -and -not $script:MirrorProcess.HasExited) { return }
     if ($script:MirrorProcess -and $script:MirrorProcess.HasExited) {
+        Add-MirrorExitDiagnostics -Process $script:MirrorProcess
         $script:MirrorProcess = $null
         $StopButton.Visibility = 'Collapsed'
-        Add-DiagnosticLine '미러링 창이 닫혔습니다.'
+        Add-DiagnosticLine '미러링 창이 닫혔습니다. 기록을 확인한 뒤 화면 연결을 다시 눌러 주세요.'
     }
 
     $state = Get-ConnectionState
@@ -252,10 +306,14 @@ function Update-ConnectionState {
 
     if ($state.Key -ne $script:LastStatusKey) {
         Add-DiagnosticLine "상태: $($state.Key)"
+        $diagnosticProperty = $state.PSObject.Properties['Diagnostic']
+        if ($null -ne $diagnosticProperty) { Add-DiagnosticLine "ADB 오류: $($diagnosticProperty.Value)" }
         $script:LastStatusKey = $state.Key
     }
 
-    if ($state.Key -eq 'ready' -and $AutoConnectCheck.IsChecked -and $AllowAutoStart) {
+    if ($state.Key -ne 'ready') { $script:LastAutoStartSerial = '' }
+    if ($state.Key -eq 'ready' -and $AutoConnectCheck.IsChecked -and $AllowAutoStart -and
+        $script:LastAutoStartSerial -ne $state.Device.Serial) {
         Start-Mirror -Device $state.Device
     }
 }
@@ -399,11 +457,19 @@ $CopyLogButton.Add_Click({
 })
 
 $timer = [System.Windows.Threading.DispatcherTimer]::new()
-$timer.Interval = [TimeSpan]::FromSeconds(1.5)
+$timer.Interval = [TimeSpan]::FromSeconds(3)
 $timer.Add_Tick({ Update-ConnectionState })
 
 $window.Add_ContentRendered({
     Add-DiagnosticLine "곰도리 미러 시작 / Windows $([Environment]::OSVersion.Version)"
+    $adbVersion = Invoke-Adb -Arguments @('version')
+    if ($adbVersion.ExitCode -eq 0) {
+        ($adbVersion.Output -split "`r?`n" | Select-Object -First 2) |
+            ForEach-Object { Add-DiagnosticLine $_ }
+    }
+    else {
+        Add-DiagnosticLine "ADB 시작 확인 실패: $($adbVersion.Error)"
+    }
     Update-ConnectionState
     $timer.Start()
 })
