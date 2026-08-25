@@ -35,7 +35,15 @@ Expand-Archive -LiteralPath $downloadPath -DestinationPath $expandedPath -Force
 $scrcpyFolder = Get-ChildItem -LiteralPath $expandedPath -Directory | Select-Object -First 1
 if ($null -eq $scrcpyFolder) { throw 'scrcpy 압축 구조를 확인할 수 없습니다.' }
 
-Copy-Item -LiteralPath (Join-Path $projectRoot '곰도리 미러 시작.cmd') -Destination $stagePath
+$launcherSource = Join-Path $projectRoot '곰도리 미러 시작.cmd'
+$launcherDestination = Join-Path $stagePath '곰도리 미러 시작.cmd'
+$launcherText = [System.IO.File]::ReadAllText($launcherSource)
+$launcherText = [regex]::Replace($launcherText, "`r?`n", "`r`n")
+[System.IO.File]::WriteAllText(
+    $launcherDestination,
+    $launcherText,
+    [System.Text.UTF8Encoding]::new($false)
+)
 Copy-Item -LiteralPath (Join-Path $projectRoot 'app\GomdoryMirror.ps1') -Destination (Join-Path $stagePath 'app')
 Copy-Item -LiteralPath (Join-Path $projectRoot '처음 연결하기.txt') -Destination $stagePath
 Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination $stagePath

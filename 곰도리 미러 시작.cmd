@@ -2,10 +2,10 @@
 setlocal
 cd /d "%~dp0"
 
-where powershell.exe >nul 2>&1
-if errorlevel 1 (
-  echo Windows PowerShell을 찾을 수 없습니다.
-  echo Windows 10 또는 Windows 11에서 실행해 주세요.
+set "POWERSHELL_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+if not exist "%POWERSHELL_EXE%" (
+  echo Windows PowerShell was not found.
+  echo Gomdory Mirror requires Windows 10 or Windows 11.
   pause
   exit /b 1
 )
@@ -14,5 +14,5 @@ set "LOG_DIR=%LOCALAPPDATA%\GomdoryMirror"
 set "LOG_FILE=%LOG_DIR%\startup.log"
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%" >nul 2>&1
 echo [%date% %time%] Gomdory Mirror start>>"%LOG_FILE%"
-start "Gomdory Mirror" powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -STA -File "%~dp0app\GomdoryMirror.ps1" 1>>"%LOG_FILE%" 2>&1
+start "Gomdory Mirror" "%POWERSHELL_EXE%" -NoLogo -NoProfile -ExecutionPolicy Bypass -STA -File "%~dp0app\GomdoryMirror.ps1" 1>>"%LOG_FILE%" 2>&1
 exit /b 0

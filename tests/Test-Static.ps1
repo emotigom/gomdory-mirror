@@ -30,6 +30,7 @@ $parseMessages = @($parseErrors | ForEach-Object { $_.Message })
 Assert-True ($parseErrors.Count -eq 0) ("빌드 PowerShell 문법 오류: " + ($parseMessages -join '; '))
 
 $appText = Get-Content -LiteralPath $app -Raw
+$launcherText = Get-Content -LiteralPath $launcher -Raw
 Assert-True ($appText.Contains("'--no-control'")) '보기 전용 옵션이 누락되었습니다.'
 Assert-True ($appText.Contains("'--fullscreen'")) '전체 화면 옵션이 누락되었습니다.'
 Assert-True ($appText.Contains("'unauthorized'")) 'USB 승인 대기 상태가 누락되었습니다.'
@@ -37,6 +38,8 @@ Assert-True ($appText.Contains('AutoConnectCheck')) '자동 연결 기능이 누
 Assert-True ($appText.Contains('ReadToEndAsync')) 'ADB/scrcpy 비동기 출력 처리가 누락되었습니다.'
 Assert-True ($appText.Contains('Add-MirrorExitDiagnostics')) 'scrcpy 종료 진단이 누락되었습니다.'
 Assert-True ($appText.Contains('LastAutoStartSerial')) '자동 재시작 반복 방지가 누락되었습니다.'
+Assert-True ($launcherText.Contains('%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe')) 'Windows PowerShell 절대 경로 실행이 누락되었습니다.'
+Assert-True (-not ($launcherText.ToCharArray() | Where-Object { [int]$_ -gt 127 })) 'CMD 시작 파일은 코드페이지 충돌 방지를 위해 ASCII만 사용해야 합니다.'
 
 if ($failures.Count -gt 0) {
     $failures | ForEach-Object { Write-Error $_ }
