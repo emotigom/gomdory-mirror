@@ -20,12 +20,14 @@ Assert-True (Test-Path -LiteralPath $builder) '포터블 빌드 스크립트가 
 $tokens = $null
 $parseErrors = $null
 [System.Management.Automation.Language.Parser]::ParseFile($app, [ref]$tokens, [ref]$parseErrors) | Out-Null
-Assert-True ($parseErrors.Count -eq 0) ("GUI PowerShell 문법 오류: " + ($parseErrors.Message -join '; '))
+$parseMessages = @($parseErrors | ForEach-Object { $_.Message })
+Assert-True ($parseErrors.Count -eq 0) ("GUI PowerShell 문법 오류: " + ($parseMessages -join '; '))
 
 $tokens = $null
 $parseErrors = $null
 [System.Management.Automation.Language.Parser]::ParseFile($builder, [ref]$tokens, [ref]$parseErrors) | Out-Null
-Assert-True ($parseErrors.Count -eq 0) ("빌드 PowerShell 문법 오류: " + ($parseErrors.Message -join '; '))
+$parseMessages = @($parseErrors | ForEach-Object { $_.Message })
+Assert-True ($parseErrors.Count -eq 0) ("빌드 PowerShell 문법 오류: " + ($parseMessages -join '; '))
 
 $appText = Get-Content -LiteralPath $app -Raw
 Assert-True ($appText.Contains("'--no-control'")) '보기 전용 옵션이 누락되었습니다.'
