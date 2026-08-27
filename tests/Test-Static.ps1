@@ -47,6 +47,8 @@ Assert-True ($appText.Contains('DeviceCombo')) '복수 Android 기기 선택 기
 Assert-True ($appText.Contains('Get-DeviceInfo')) 'Android 기기 정보 판별 기능이 누락되었습니다.'
 Assert-True ($appText.Contains('Stop-ProcessTree')) '프로세스 트리 종료 처리가 누락되었습니다.'
 Assert-True ($appText.Contains('WaitForMirrorWindow')) '미러 창 준비 확인이 누락되었습니다.'
+Assert-True ($appText.Contains('MirrorWindowShown')) '영상 창 한 번 종료 상태 처리가 누락되었습니다.'
+Assert-True ($appText.Contains('$window.Close()')) '영상 창 종료 후 앱 전체 종료 처리가 누락되었습니다.'
 Assert-True ($appText.Contains('Dispatcher]::Run')) '비모달 앱 메시지 루프가 누락되었습니다.'
 Assert-True (-not ($appText -match '\$window\.ShowDialog\(')) '숨김 시 종료되는 모달 창 호출이 남아 있습니다.'
 

@@ -45,6 +45,8 @@ def main() -> int:
         "Stop-ProcessTree",
         "Restore-ControlWindow",
         "WaitForMirrorWindow",
+        "MirrorWindowShown",
+        "$window.Close()",
         "Dispatcher]::Run",
         "ReadToEndAsync",
     ]

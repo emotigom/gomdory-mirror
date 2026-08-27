@@ -13,6 +13,7 @@ $script:CoreModulePath = Join-Path $PSScriptRoot 'GomdoryMirror.Core.psm1'
 $script:MirrorProcess = $null
 $script:MirrorStdOutTask = $null
 $script:MirrorStdErrTask = $null
+$script:MirrorWindowShown = $false
 $script:LastAutoStartSerial = ''
 $script:SelectedSerial = ''
 $script:DeviceInfoCache = @{}
@@ -248,8 +249,8 @@ function Add-MirrorExitDiagnostics {
 
 function WaitForMirrorWindow {
     param([System.Diagnostics.Process]$Process)
-    for ($i = 0; $i -lt 12; $i++) {
-        Start-Sleep -Milliseconds 150
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Milliseconds 200
         try {
             $Process.Refresh()
             if ($Process.HasExited) { return $false }
@@ -257,13 +258,14 @@ function WaitForMirrorWindow {
         }
         catch { return $false }
     }
-    return -not $Process.HasExited
+    return $false
 }
 
 function Start-Mirror {
     param($Device)
     if ($null -eq $Device) { return }
     if ($script:MirrorProcess -and -not $script:MirrorProcess.HasExited) { return }
+    $script:MirrorWindowShown = $false
     $arguments = @("--serial=$($Device.Serial)", '--window-title=곰도리 미러', '--no-control', '--no-audio', '--stay-awake', '--disable-screensaver')
     $arguments += Get-QualityArguments
     if ($FullscreenCheck.IsChecked) { $arguments += '--fullscreen' }
@@ -289,8 +291,20 @@ function Start-Mirror {
         $deviceVersion = if ([string]::IsNullOrWhiteSpace([string]$Device.AndroidVersion)) { 'Android 버전 미확인' } else { "Android $($Device.AndroidVersion)" }
         Add-DiagnosticLine "화면 전송 시작: $($Device.Manufacturer) $($Device.Model) / $deviceKind / $deviceVersion / $($Device.ConnectionType)"
         if (WaitForMirrorWindow -Process $script:MirrorProcess) {
+            $script:MirrorWindowShown = $true
             # ShowDialog()가 아닌 일반 창이므로 Hide() 뒤에도 앱이 종료되지 않습니다.
             $window.Hide()
+        }
+        else {
+            Stop-ProcessTree -Process $script:MirrorProcess
+            try { $script:MirrorProcess.WaitForExit(2000) | Out-Null } catch { }
+            if ($script:MirrorProcess.HasExited) { Add-MirrorExitDiagnostics -Process $script:MirrorProcess }
+            $script:MirrorProcess = $null
+            $StopButton.Visibility = 'Collapsed'
+            $PrimaryButton.IsEnabled = $true
+            Add-DiagnosticLine '6초 안에 영상 창이 준비되지 않아 시작을 취소했습니다.'
+            [System.Windows.MessageBox]::Show('화면을 열지 못했습니다. 케이블을 다시 연결한 뒤 한 번 더 시도해 주세요.', '곰도리 미러', 'OK', 'Warning') | Out-Null
+            Refresh-Connection -AllowAutoStart:$false
         }
     }
     catch {
@@ -302,6 +316,7 @@ function Start-Mirror {
 
 function Stop-Mirror {
     $AutoConnectCheck.IsChecked = $false
+    $script:MirrorWindowShown = $false
     if ($script:MirrorProcess -and -not $script:MirrorProcess.HasExited) {
         Stop-ProcessTree -Process $script:MirrorProcess
         try { $script:MirrorProcess.WaitForExit(2000) | Out-Null } catch { }
@@ -349,6 +364,12 @@ function Refresh-Connection {
         Add-MirrorExitDiagnostics -Process $script:MirrorProcess
         $script:MirrorProcess = $null
         $StopButton.Visibility = 'Collapsed'
+        if ($script:MirrorWindowShown) {
+            $script:MirrorWindowShown = $false
+            Add-DiagnosticLine '영상 창이 닫혀 곰도리 미러를 완전히 종료합니다.'
+            $window.Close()
+            return
+        }
         Restore-ControlWindow
         $AutoConnectCheck.IsChecked = $false
         Add-DiagnosticLine '미러 창이 닫혔습니다. 필요하면 “화면 열기”를 다시 누르세요.'
