@@ -18,10 +18,13 @@
 - 노트북에서 Android 기기를 조작하지 않는 발표용 기본값
 - 연결 중에는 준비 창을 숨기고 `곰도리 미러` 영상 창 하나만 표시
 - 영상 창의 X를 누르면 곰도리 미러 전체가 종료되어, 실행 파일을 다시 눌렀을 때 깨끗하게 새로 시작
+- 실행 파일을 여러 번 눌러도 중복 실행하지 않고 기존 준비 창을 앞으로 가져옴
 
 ## 개발 상태
 
 `v0.3.0-dev`부터 ADB가 지원되는 Android 5.0 이상 휴대전화·태블릿을 공통 대상으로 삼습니다. Galaxy Tab S7 외 기기는 실제 기종별 현장 검증을 계속 확대합니다. 배포 ZIP은 GitHub Actions의 `build-portable` 작업으로 생성합니다.
+
+현장 시험에는 Actions의 `Gomdory-Mirror-Ready-To-Test` 산출물을 받습니다. 한 번만 압축을 풀면 바로 실행할 수 있습니다. `Gomdory-Mirror-Portable` 산출물은 릴리스용 ZIP과 SHA-256 파일을 함께 보관합니다.
 
 지원 경계와 기종별 검증 순서는 [Android 공통 지원 설계](docs/ANDROID_SUPPORT.md)에 정리되어 있습니다.
 

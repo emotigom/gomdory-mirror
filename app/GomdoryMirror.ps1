@@ -21,6 +21,23 @@ $script:DeviceListSignature = ''
 $script:IsUpdatingDevicePicker = $false
 $script:IsClosing = $false
 $script:LogPath = Join-Path $env:LOCALAPPDATA 'GomdoryMirror\gomdory-mirror.log'
+$script:InstanceMutex = $null
+$script:ShowSignal = $null
+
+$createdNewInstance = $false
+$script:InstanceMutex = [System.Threading.Mutex]::new($true, 'Local\GomdoryMirror.App', [ref]$createdNewInstance)
+if (-not $createdNewInstance) {
+    try {
+        $existingSignal = [System.Threading.EventWaitHandle]::OpenExisting('Local\GomdoryMirror.Show')
+        $existingSignal.Set() | Out-Null
+        $existingSignal.Dispose()
+    }
+    catch { }
+    $script:InstanceMutex.Dispose()
+    [System.Windows.MessageBox]::Show('곰도리 미러가 이미 실행 중입니다. 기존 준비 창을 앞으로 가져옵니다.', '곰도리 미러', 'OK', 'Information') | Out-Null
+    exit 0
+}
+$script:ShowSignal = [System.Threading.EventWaitHandle]::new($false, [System.Threading.EventResetMode]::AutoReset, 'Local\GomdoryMirror.Show')
 
 Import-Module -Name $script:CoreModulePath -Force
 
@@ -435,9 +452,19 @@ $DriverButton.Add_Click({ Start-Process 'https://developer.android.com/studio/ru
 $CopyLogButton.Add_Click({ [System.Windows.Clipboard]::SetText($DiagnosticBox.Text); $CopyLogButton.Content = '복사됨' })
 $timer = [System.Windows.Threading.DispatcherTimer]::new()
 $timer.Interval = [TimeSpan]::FromSeconds(2)
-$timer.Add_Tick({ Refresh-Connection })
+$timer.Add_Tick({
+    if ($null -ne $script:ShowSignal -and $script:ShowSignal.WaitOne(0)) { Restore-ControlWindow }
+    Refresh-Connection
+})
 $window.Add_ContentRendered({ Add-DiagnosticLine "곰도리 미러 시작 / Windows $([Environment]::OSVersion.Version)"; Refresh-Connection -AllowAutoStart:$false; $timer.Start() })
-$window.Add_Closed({ $script:IsClosing = $true; $timer.Stop(); if ($script:MirrorProcess -and -not $script:MirrorProcess.HasExited) { Stop-ProcessTree -Process $script:MirrorProcess }; $window.Dispatcher.BeginInvokeShutdown([System.Windows.Threading.DispatcherPriority]::Normal) })
+$window.Add_Closed({
+    $script:IsClosing = $true
+    $timer.Stop()
+    if ($script:MirrorProcess -and -not $script:MirrorProcess.HasExited) { Stop-ProcessTree -Process $script:MirrorProcess }
+    if ($null -ne $script:ShowSignal) { try { $script:ShowSignal.Dispose() } catch { }; $script:ShowSignal = $null }
+    if ($null -ne $script:InstanceMutex) { try { $script:InstanceMutex.ReleaseMutex() } catch { }; try { $script:InstanceMutex.Dispose() } catch { }; $script:InstanceMutex = $null }
+    $window.Dispatcher.BeginInvokeShutdown([System.Windows.Threading.DispatcherPriority]::Normal)
+})
 trap { Write-AppLog "치명적 오류: $($_.Exception.Message)"; try { [System.Windows.MessageBox]::Show("프로그램 오류가 기록되었습니다.`r`n$script:LogPath", '곰도리 미러', 'OK', 'Error') | Out-Null } catch { }; exit 1 }
 
 # ShowDialog()를 사용하지 않습니다. 창을 숨겨도 메시지 루프가 살아 있어 미러 창이 닫힌 뒤 준비 창으로 안전하게 돌아옵니다.

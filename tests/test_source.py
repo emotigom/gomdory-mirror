@@ -47,6 +47,8 @@ def main() -> int:
         "WaitForMirrorWindow",
         "MirrorWindowShown",
         "$window.Close()",
+        "Local\\GomdoryMirror.App",
+        "Local\\GomdoryMirror.Show",
         "Dispatcher]::Run",
         "ReadToEndAsync",
     ]
@@ -60,6 +62,10 @@ def main() -> int:
     require("Get-FileHash" in builder, "scrcpy 다운로드 무결성 검증이 없습니다.")
     require("5b12172b3264b2889f4583ee64752ce832e29bc8b1089dca81093459697165db" in builder,
             "scrcpy v4.1 SHA-256 고정값이 없습니다.")
+
+    workflow = (ROOT / ".github" / "workflows" / "build-portable.yml").read_text(encoding="utf-8")
+    require("Gomdory-Mirror-Ready-To-Test" in workflow, "한 번만 압축 해제하는 테스트용 산출물이 없습니다.")
+    require("steps.package.outputs.version" in workflow, "테스트용 산출물 버전 경로가 연결되지 않았습니다.")
 
     print("소스 구조 검증 통과")
     return 0

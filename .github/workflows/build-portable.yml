@@ -32,11 +32,20 @@ jobs:
         run: python tests/test_source.py
 
       - name: Build portable ZIP
+        id: package
         shell: powershell
         run: |
           $version = "${{ github.ref_name }}" -replace '^v', ''
           if ($version -eq '${{ github.ref_name }}') { $version = '0.3.0-dev' }
           .\scripts\build-portable.ps1 -Version $version
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "version=$version`n", [System.Text.UTF8Encoding]::new($false))
+
+      - name: Upload ready-to-test folder
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gomdory-Mirror-Ready-To-Test
+          path: dist/Gomdory-Mirror-Portable-v${{ steps.package.outputs.version }}/
+          if-no-files-found: error
 
       - name: Upload portable package
         uses: actions/upload-artifact@v4
