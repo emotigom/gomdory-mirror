@@ -82,6 +82,8 @@ Assert-True ((Get-AndroidDeviceKind -Properties $phoneProps -SizeOutput 'Physica
 
 $builderText = Get-Content -LiteralPath $builder -Raw
 Assert-True ($builderText.Contains("app\*")) '공통 연결 모듈이 포터블 ZIP에 포함되지 않습니다.'
+Assert-True ($builderText.Contains('ZipFile]::OpenRead')) '포터블 ZIP 내부 검증이 누락되었습니다.'
+Assert-True ($builderText.Contains('GomdoryMirror.Core.psm1')) '포터블 ZIP 공통 모듈 검증이 누락되었습니다.'
 
 if ($failures.Count -gt 0) {
     $failures | ForEach-Object { Write-Error $_ }

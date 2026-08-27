@@ -55,6 +55,8 @@ def main() -> int:
 
     builder = (ROOT / "scripts" / "build-portable.ps1").read_text(encoding="utf-8")
     require("app\\*" in builder, "Android 공통 연결 모듈 패키징이 없습니다.")
+    require("ZipFile]::OpenRead" in builder, "포터블 ZIP 내부 검증이 없습니다.")
+    require("GomdoryMirror.Core.psm1" in builder, "포터블 ZIP 공통 모듈 검증이 없습니다.")
     require("Get-FileHash" in builder, "scrcpy 다운로드 무결성 검증이 없습니다.")
     require("5b12172b3264b2889f4583ee64752ce832e29bc8b1089dca81093459697165db" in builder,
             "scrcpy v4.1 SHA-256 고정값이 없습니다.")
