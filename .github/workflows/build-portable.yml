@@ -32,7 +32,7 @@ jobs:
         shell: powershell
         run: |
           $version = "${{ github.ref_name }}" -replace '^v', ''
-          if ($version -eq '${{ github.ref_name }}') { $version = '0.2.0-dev' }
+          if ($version -eq '${{ github.ref_name }}') { $version = '0.3.0-dev' }
           .\scripts\build-portable.ps1 -Version $version
 
       - name: Upload portable package

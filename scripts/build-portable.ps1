@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Version = '0.1.0',
+    [string]$Version = '0.3.0-dev',
     [string]$ScrcpyVersion = '4.1',
     [string]$ScrcpySha256 = '5b12172b3264b2889f4583ee64752ce832e29bc8b1089dca81093459697165db'
 )
@@ -44,7 +44,7 @@ $launcherText = [regex]::Replace($launcherText, "`r?`n", "`r`n")
     $launcherText,
     [System.Text.UTF8Encoding]::new($false)
 )
-Copy-Item -LiteralPath (Join-Path $projectRoot 'app\GomdoryMirror.ps1') -Destination (Join-Path $stagePath 'app')
+Copy-Item -Path (Join-Path $projectRoot 'app\*') -Destination (Join-Path $stagePath 'app') -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot '처음 연결하기.txt') -Destination $stagePath
 Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination $stagePath
 Copy-Item -LiteralPath (Join-Path $projectRoot 'NOTICE') -Destination $stagePath

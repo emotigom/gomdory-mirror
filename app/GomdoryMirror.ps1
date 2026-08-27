@@ -9,12 +9,19 @@ $script:RootPath = Split-Path -Parent $PSScriptRoot
 $script:EnginePath = Join-Path $script:RootPath 'tools\scrcpy'
 $script:AdbPath = Join-Path $script:EnginePath 'adb.exe'
 $script:ScrcpyPath = Join-Path $script:EnginePath 'scrcpy.exe'
+$script:CoreModulePath = Join-Path $PSScriptRoot 'GomdoryMirror.Core.psm1'
 $script:MirrorProcess = $null
 $script:MirrorStdOutTask = $null
 $script:MirrorStdErrTask = $null
 $script:LastAutoStartSerial = ''
+$script:SelectedSerial = ''
+$script:DeviceInfoCache = @{}
+$script:DeviceListSignature = ''
+$script:IsUpdatingDevicePicker = $false
 $script:IsClosing = $false
 $script:LogPath = Join-Path $env:LOCALAPPDATA 'GomdoryMirror\gomdory-mirror.log'
+
+Import-Module -Name $script:CoreModulePath -Force
 
 function Write-AppLog {
     param([string]$Message)
@@ -59,7 +66,7 @@ function Invoke-Adb {
         $stderr = $process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit($TimeoutMilliseconds)) {
             try { $process.Kill(); $process.WaitForExit() } catch { }
-            return [pscustomobject]@{ ExitCode = 124; Output = ''; Error = '태블릿 연결 확인 시간이 초과되었습니다.' }
+            return [pscustomobject]@{ ExitCode = 124; Output = ''; Error = 'Android 기기 연결 확인 시간이 초과되었습니다.' }
         }
         return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = $stdout.Result.Trim(); Error = $stderr.Result.Trim() }
     }
@@ -73,44 +80,126 @@ function Get-AndroidDevices {
         $message = @($result.Error, $result.Output) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
         return [pscustomobject]@{ Error = ($message -join ' / '); Devices = @() }
     }
-    $devices = @()
-    foreach ($line in ($result.Output -split "`r?`n")) {
-        if ([string]::IsNullOrWhiteSpace($line) -or $line -like 'List of devices*' -or $line -like '*daemon*') { continue }
-        if ($line -match '^([^\s]+)\s+([^\s]+)(?:\s+(.*))?$') {
-            $model = ''
-            if ($Matches[3] -match '(?:^|\s)model:([^\s]+)') { $model = $Matches[1] -replace '_', ' ' }
-            $devices += [pscustomobject]@{ Serial = $Matches[1]; State = $Matches[2]; Model = $model }
-        }
+    return [pscustomobject]@{ Error = ''; Devices = @(ConvertFrom-AdbDevicesOutput -OutputText $result.Output) }
+}
+
+function Invoke-DeviceAdb {
+    param($Device, [string[]]$Arguments, [int]$TimeoutMilliseconds = 3500)
+    $allArguments = @('-s', [string]$Device.Serial) + $Arguments
+    return Invoke-Adb -Arguments $allArguments -TimeoutMilliseconds $TimeoutMilliseconds
+}
+
+function Get-DeviceKindLabel {
+    param([string]$Kind)
+    switch ($Kind) {
+        'tablet' { return '태블릿' }
+        'phone' { return '휴대전화' }
+        default { return 'Android 기기' }
     }
-    return [pscustomobject]@{ Error = ''; Devices = @($devices) }
+}
+
+function Get-DeviceDisplayName {
+    param($Device)
+    $model = if ([string]::IsNullOrWhiteSpace([string]$Device.Model)) { 'Android 기기' } else { [string]$Device.Model }
+    $kindProperty = $Device.PSObject.Properties['Kind']
+    $kind = if ($null -ne $kindProperty) { Get-DeviceKindLabel -Kind ([string]$kindProperty.Value) } else { 'Android 기기' }
+    $connection = if ($Device.ConnectionType -eq 'wireless') { ' · 무선 ADB' } else { '' }
+    if ($model -eq 'Android 기기') { return "$kind$connection" }
+    return "$model · $kind$connection"
+}
+
+function Get-DeviceInfo {
+    param($Device)
+    if ($script:DeviceInfoCache.ContainsKey([string]$Device.Serial)) {
+        return $script:DeviceInfoCache[[string]$Device.Serial]
+    }
+
+    $propertiesResult = Invoke-DeviceAdb -Device $Device -Arguments @('shell', 'getprop') -TimeoutMilliseconds 5000
+    $properties = if ($propertiesResult.ExitCode -eq 0) { ConvertFrom-AndroidGetPropOutput -OutputText $propertiesResult.Output } else { @{} }
+    $displayResult = Invoke-DeviceAdb -Device $Device -Arguments @('shell', 'sh', '-c', 'wm size; wm density')
+
+    $manufacturer = if ($properties.ContainsKey('ro.product.manufacturer')) { [string]$properties['ro.product.manufacturer'] } else { '' }
+    $model = if ($properties.ContainsKey('ro.product.model')) { [string]$properties['ro.product.model'] } elseif (-not [string]::IsNullOrWhiteSpace([string]$Device.Model)) { [string]$Device.Model } else { 'Android 기기' }
+    $androidVersion = if ($properties.ContainsKey('ro.build.version.release')) { [string]$properties['ro.build.version.release'] } else { '' }
+    $sdk = 0
+    if ($properties.ContainsKey('ro.build.version.sdk')) { [int]::TryParse([string]$properties['ro.build.version.sdk'], [ref]$sdk) | Out-Null }
+    $kind = Get-AndroidDeviceKind -Properties $properties -SizeOutput $displayResult.Output -DensityOutput $displayResult.Output
+
+    $info = [pscustomobject]@{
+        Serial = [string]$Device.Serial
+        State = [string]$Device.State
+        Model = $model
+        Manufacturer = $manufacturer
+        AndroidVersion = $androidVersion
+        Sdk = $sdk
+        Kind = $kind
+        OemKey = Get-AndroidOemKey -Manufacturer $manufacturer
+        Product = [string]$Device.Product
+        DeviceName = [string]$Device.DeviceName
+        TransportId = [string]$Device.TransportId
+        ConnectionType = [string]$Device.ConnectionType
+    }
+
+    if ($propertiesResult.ExitCode -eq 0) { $script:DeviceInfoCache[[string]$Device.Serial] = $info }
+    return $info
+}
+
+function New-ConnectionState {
+    param(
+        [string]$Key,
+        [string]$Title,
+        [string]$Detail,
+        [string]$Color,
+        [string]$Action,
+        $Device = $null,
+        [object[]]$Devices = @(),
+        [string]$Diagnostic = ''
+    )
+    return [pscustomobject]@{ Key = $Key; Title = $Title; Detail = $Detail; Color = $Color; Action = $Action; Device = $Device; Devices = @($Devices); Diagnostic = $Diagnostic }
 }
 
 function Get-ConnectionState {
-    if (-not (Test-Path -LiteralPath $script:ScrcpyPath) -or -not (Test-Path -LiteralPath $script:AdbPath)) {
-        return [pscustomobject]@{ Key = 'engine-missing'; Title = '실행 파일을 찾지 못했습니다'; Detail = 'ZIP을 완전히 푼 뒤 폴더 안의 “곰도리 미러 시작.cmd”를 실행해 주세요.'; Color = '#B91C1C'; Action = '연결 방법'; Device = $null }
+    if (-not (Test-Path -LiteralPath $script:CoreModulePath) -or -not (Test-Path -LiteralPath $script:ScrcpyPath) -or -not (Test-Path -LiteralPath $script:AdbPath)) {
+        return New-ConnectionState -Key 'engine-missing' -Title '실행 파일을 찾지 못했습니다' -Detail 'ZIP을 완전히 푼 뒤 폴더 안의 “곰도리 미러 시작.cmd”를 실행해 주세요.' -Color '#B91C1C' -Action '연결 방법'
     }
     $scan = Get-AndroidDevices
     if (-not [string]::IsNullOrWhiteSpace($scan.Error)) {
-        return [pscustomobject]@{ Key = 'adb-error'; Title = '태블릿 연결을 확인하지 못했습니다'; Detail = '케이블을 다시 연결한 뒤 “다시 확인”을 누르세요.'; Color = '#B91C1C'; Action = '다시 확인'; Device = $null; Diagnostic = $scan.Error }
+        return New-ConnectionState -Key 'adb-error' -Title 'Android 기기 연결을 확인하지 못했습니다' -Detail '케이블을 다시 연결한 뒤 “다시 확인”을 누르세요.' -Color '#B91C1C' -Action '다시 확인' -Diagnostic $scan.Error
     }
-    $ready = @($scan.Devices | Where-Object { $_.State -eq 'device' })
+    $ready = @($scan.Devices | Where-Object { $_.State -eq 'device' } | ForEach-Object { Get-DeviceInfo -Device $_ })
     $unauthorized = @($scan.Devices | Where-Object { $_.State -eq 'unauthorized' })
     $offline = @($scan.Devices | Where-Object { $_.State -eq 'offline' })
-    if ($ready.Count -gt 1) {
-        return [pscustomobject]@{ Key = 'multiple'; Title = '태블릿이 여러 대 연결되어 있습니다'; Detail = '수업에 쓸 태블릿 하나만 남기고 다른 Android 기기의 USB 케이블을 빼 주세요.'; Color = '#B45309'; Action = '다시 확인'; Device = $null }
-    }
-    if ($ready.Count -eq 1) {
-        $device = $ready[0]
-        $name = if ([string]::IsNullOrWhiteSpace($device.Model)) { '태블릿' } else { $device.Model }
-        return [pscustomobject]@{ Key = 'ready'; Title = "$name 연결 완료"; Detail = '이제 “화면 열기”를 누르세요. 주강사는 태블릿을 직접 조작합니다.'; Color = '#15803D'; Action = '화면 열기'; Device = $device }
+    if ($ready.Count -gt 0) {
+        $device = $ready | Where-Object { $_.Serial -eq $script:SelectedSerial } | Select-Object -First 1
+        if ($null -eq $device) { $device = $ready[0]; $script:SelectedSerial = [string]$device.Serial }
+        $name = Get-DeviceDisplayName -Device $device
+        if ($device.Sdk -gt 0 -and $device.Sdk -lt 21) {
+            return New-ConnectionState -Key 'unsupported' -Title "$name은 지원되지 않습니다" -Detail '곰도리 미러는 Android 5.0 이상 기기를 지원합니다.' -Color '#B91C1C' -Action '연결 방법' -Device $device -Devices $ready
+        }
+        $version = if ([string]::IsNullOrWhiteSpace($device.AndroidVersion)) { '' } else { " · Android $($device.AndroidVersion)" }
+        $detail = if ($ready.Count -gt 1) {
+            '연결된 기기 중 수업에 사용할 화면을 선택했습니다. 다른 기기로 바꾸려면 아래 목록을 누르세요.'
+        }
+        elseif ($device.ConnectionType -eq 'wireless') {
+            '무선 ADB로 연결되어 있습니다. 수업 안정성을 높이려면 USB 데이터 케이블을 연결하세요.'
+        }
+        else {
+            '이제 “화면 열기”를 누르세요. 화면 조작은 Android 기기에서 직접 합니다.'
+        }
+        return New-ConnectionState -Key 'ready' -Title "$name 연결 완료$version" -Detail $detail -Color '#15803D' -Action '화면 열기' -Device $device -Devices $ready
     }
     if ($unauthorized.Count -gt 0) {
-        return [pscustomobject]@{ Key = 'unauthorized'; Title = '태블릿에서 USB 디버깅을 허용해 주세요'; Detail = '태블릿 잠금을 풀고 “이 컴퓨터에서 항상 허용”을 체크한 뒤 허용을 누르세요.'; Color = '#B45309'; Action = '허용 후 다시 확인'; Device = $unauthorized[0] }
+        $noun = if ($unauthorized.Count -gt 1) { 'Android 기기들' } else { 'Android 기기' }
+        return New-ConnectionState -Key 'unauthorized' -Title "$noun에서 USB 디버깅을 허용해 주세요" -Detail '기기 잠금을 풀고 “이 컴퓨터에서 항상 허용”을 체크한 뒤 허용을 누르세요.' -Color '#B45309' -Action '허용 후 다시 확인' -Device $unauthorized[0]
     }
     if ($offline.Count -gt 0) {
-        return [pscustomobject]@{ Key = 'offline'; Title = '태블릿이 응답하지 않습니다'; Detail = '태블릿 잠금을 해제하고 케이블을 한 번 뺐다가 다시 연결해 주세요.'; Color = '#B45309'; Action = '다시 확인'; Device = $offline[0] }
+        return New-ConnectionState -Key 'offline' -Title 'Android 기기가 응답하지 않습니다' -Detail '기기 잠금을 해제하고 케이블을 한 번 뺐다가 다시 연결해 주세요.' -Color '#B45309' -Action '다시 확인' -Device $offline[0]
     }
-    return [pscustomobject]@{ Key = 'no-device'; Title = '태블릿을 연결해 주세요'; Detail = '데이터 전송이 가능한 USB 케이블을 연결하고, 처음이면 USB 디버깅을 허용해 주세요.'; Color = '#6B7280'; Action = '연결 방법'; Device = $null }
+    $other = @($scan.Devices | Where-Object { $_.State -notin @('device', 'unauthorized', 'offline') })
+    if ($other.Count -gt 0) {
+        return New-ConnectionState -Key 'unknown-state' -Title 'Android 기기가 일반 실행 상태가 아닙니다' -Detail '기기를 정상적으로 켜고 잠금을 해제한 뒤 USB 케이블을 다시 연결하세요.' -Color '#B45309' -Action '다시 확인' -Device $other[0] -Diagnostic "ADB 상태: $($other[0].State)"
+    }
+    return New-ConnectionState -Key 'no-device' -Title 'Android 태블릿이나 휴대전화를 연결해 주세요' -Detail '데이터 전송용 USB 케이블을 연결하고, 처음이면 기기에서 USB 디버깅을 허용해 주세요.' -Color '#6B7280' -Action '연결 방법'
 }
 
 function Get-QualityArguments {
@@ -196,7 +285,9 @@ function Start-Mirror {
         $StatusDot.Fill = '#15803D'
         $PrimaryButton.IsEnabled = $false
         $StopButton.Visibility = 'Visible'
-        Add-DiagnosticLine "화면 전송 시작: $($Device.Model)"
+        $deviceKind = Get-DeviceKindLabel -Kind ([string]$Device.Kind)
+        $deviceVersion = if ([string]::IsNullOrWhiteSpace([string]$Device.AndroidVersion)) { 'Android 버전 미확인' } else { "Android $($Device.AndroidVersion)" }
+        Add-DiagnosticLine "화면 전송 시작: $($Device.Manufacturer) $($Device.Model) / $deviceKind / $deviceVersion / $($Device.ConnectionType)"
         if (WaitForMirrorWindow -Process $script:MirrorProcess) {
             # ShowDialog()가 아닌 일반 창이므로 Hide() 뒤에도 앱이 종료되지 않습니다.
             $window.Hide()
@@ -222,6 +313,33 @@ function Stop-Mirror {
     Refresh-Connection -AllowAutoStart:$false
 }
 
+function Update-DevicePicker {
+    param([object[]]$Devices)
+    $devicesArray = @($Devices)
+    $DevicePickerPanel.Visibility = if ($devicesArray.Count -gt 1) { 'Visible' } else { 'Collapsed' }
+    if ($devicesArray.Count -le 1) {
+        $script:DeviceListSignature = ''
+        $DeviceCombo.ItemsSource = $null
+        return
+    }
+
+    $items = @($devicesArray | ForEach-Object {
+        [pscustomobject]@{ Serial = [string]$_.Serial; Label = Get-DeviceDisplayName -Device $_ }
+    })
+    $signature = ($items | ForEach-Object { "$($_.Serial)|$($_.Label)" }) -join ';'
+    if ($signature -eq $script:DeviceListSignature -and $DeviceCombo.SelectedValue -eq $script:SelectedSerial) { return }
+
+    $script:IsUpdatingDevicePicker = $true
+    try {
+        $DeviceCombo.ItemsSource = $items
+        $DeviceCombo.DisplayMemberPath = 'Label'
+        $DeviceCombo.SelectedValuePath = 'Serial'
+        $DeviceCombo.SelectedValue = $script:SelectedSerial
+        $script:DeviceListSignature = $signature
+    }
+    finally { $script:IsUpdatingDevicePicker = $false }
+}
+
 function Refresh-Connection {
     param([bool]$AllowAutoStart = $true)
     if ($script:IsClosing) { return }
@@ -236,51 +354,63 @@ function Refresh-Connection {
         Add-DiagnosticLine '미러 창이 닫혔습니다. 필요하면 “화면 열기”를 다시 누르세요.'
     }
     $state = Get-ConnectionState
+    Update-DevicePicker -Devices $state.Devices
     $StatusTitle.Text = $state.Title
     $StatusDetail.Text = $state.Detail
     $StatusDot.Fill = $state.Color
     $PrimaryButton.Content = $state.Action
     $PrimaryButton.Tag = $state
     $PrimaryButton.IsEnabled = $true
-    $diagnostic = $state.PSObject.Properties['Diagnostic']
-    if ($null -ne $diagnostic) { Add-DiagnosticLine "ADB: $($diagnostic.Value)" }
+    if (-not [string]::IsNullOrWhiteSpace($state.Diagnostic)) { Add-DiagnosticLine "ADB: $($state.Diagnostic)" }
     if ($state.Key -ne 'ready') { $script:LastAutoStartSerial = '' }
     if ($state.Key -eq 'ready' -and $AutoConnectCheck.IsChecked -and $AllowAutoStart -and $script:LastAutoStartSerial -ne $state.Device.Serial) { Start-Mirror -Device $state.Device }
 }
 
 function Show-SetupGuide {
     [System.Windows.MessageBox]::Show(@'
-처음 한 번만 태블릿에서 설정합니다.
+처음 한 번만 Android 기기에서 설정합니다.
 
-1. 설정 → 태블릿 정보 → 소프트웨어 정보 → 빌드번호 7번 누르기
+1. 설정 → 휴대전화 정보/태블릿 정보 → 빌드번호 7번 누르기
 2. 설정 → 개발자 옵션 → USB 디버깅 켜기
 3. 데이터 전송용 USB 케이블로 노트북 연결
-4. 태블릿에 뜨는 “이 컴퓨터에서 항상 허용”을 체크하고 허용
+4. 기기에 뜨는 “이 컴퓨터에서 항상 허용”을 체크하고 허용
+
+제조사에 따라 메뉴 이름이 다를 수 있습니다.
+· Samsung: 기기 정보 → 소프트웨어 정보 → 빌드번호
+· Google Pixel/Lenovo/Motorola: 기기 정보 → 빌드번호
+· Xiaomi/Redmi/POCO: 내 기기 → OS 버전을 7번 누른 뒤 추가 설정 → 개발자 옵션
 
 연결이 안 되면 충전 전용 케이블인지 먼저 확인해 주세요.
 '@, '처음 연결하는 방법', 'OK', 'Information') | Out-Null
 }
 
 [xml]$xaml = @'
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="곰도리 미러" Width="620" Height="500" MinWidth="580" MinHeight="460" WindowStartupLocation="CenterScreen" Background="#F7F5F0" FontFamily="Malgun Gothic">
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="곰도리 미러" Width="660" Height="590" MinWidth="600" MinHeight="540" WindowStartupLocation="CenterScreen" Background="#F7F5F0" FontFamily="Malgun Gothic">
   <Grid Margin="32,28,32,24">
-    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="18"/><RowDefinition Height="Auto"/><RowDefinition Height="18"/><RowDefinition Height="Auto"/><RowDefinition Height="16"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
-    <StackPanel Grid.Row="0"><TextBlock Text="곰도리 미러" FontSize="30" FontWeight="Bold" Foreground="#1F3A35"/><TextBlock Text="태블릿을 케이블로 연결해 TV에 띄웁니다" Margin="0,6,0,0" FontSize="15" Foreground="#66736F"/></StackPanel>
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="18"/><RowDefinition Height="Auto"/><RowDefinition Height="14"/><RowDefinition Height="Auto"/><RowDefinition Height="14"/><RowDefinition Height="Auto"/><RowDefinition Height="16"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <StackPanel Grid.Row="0"><TextBlock Text="곰도리 미러" FontSize="30" FontWeight="Bold" Foreground="#1F3A35"/><TextBlock Text="Android 태블릿과 휴대전화를 케이블로 연결해 TV에 띄웁니다" Margin="0,6,0,0" FontSize="15" Foreground="#66736F"/></StackPanel>
     <Border Grid.Row="2" Background="White" BorderBrush="#DDD8CE" BorderThickness="1" Padding="22"><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="22"/><ColumnDefinition Width="14"/><ColumnDefinition/></Grid.ColumnDefinitions><Ellipse x:Name="StatusDot" Width="16" Height="16" Fill="#6B7280" VerticalAlignment="Top" Margin="0,5,0,0"/><StackPanel Grid.Column="2"><TextBlock x:Name="StatusTitle" Text="연결 상태를 확인하고 있습니다" FontSize="20" FontWeight="Bold" Foreground="#1F2937"/><TextBlock x:Name="StatusDetail" Text="잠시만 기다려 주세요." Margin="0,8,0,0" FontSize="14" Foreground="#4B5563" TextWrapping="Wrap" LineHeight="22"/></StackPanel></Grid></Border>
-    <Grid Grid.Row="4"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="18"/><ColumnDefinition Width="150"/></Grid.ColumnDefinitions><StackPanel><CheckBox x:Name="AutoConnectCheck" Content="다음부터 케이블 연결 시 자동으로 화면 열기" IsChecked="False" FontSize="13" Foreground="#374151"/><CheckBox x:Name="FullscreenCheck" Content="TV 전체 화면으로 열기" IsChecked="False" Margin="0,10,0,0" FontSize="13" Foreground="#374151"/><TextBlock Text="기본 창 모드에서는 미러 창의 X 한 번으로 종료합니다." Margin="0,10,0,0" FontSize="12" Foreground="#6B7280"/></StackPanel><StackPanel Grid.Column="2"><TextBlock Text="화질" FontSize="13" Foreground="#4B5563" Margin="0,0,0,5"/><ComboBox x:Name="QualityCombo" SelectedIndex="1" FontSize="14" Padding="8,6"><ComboBoxItem Content="빠르게"/><ComboBoxItem Content="균형 있게"/><ComboBoxItem Content="선명하게"/></ComboBox></StackPanel></Grid>
-    <Expander Grid.Row="6" Header="문제가 있을 때만 열기 · 진단 기록" Foreground="#4B5563" FontSize="13"><Grid Margin="0,10,0,0"><Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions><TextBox x:Name="DiagnosticBox" MinHeight="105" IsReadOnly="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" Background="#FAF9F6" BorderBrush="#D6D1C8" FontFamily="Consolas" FontSize="11" Foreground="#374151" Padding="8"/><StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,8,0,0"><Button x:Name="GuideButton" Content="처음 연결" Background="#6B7280" Foreground="White" Padding="11,6" BorderThickness="0"/><Button x:Name="DriverButton" Content="Samsung 드라이버" Background="#6B7280" Foreground="White" Padding="11,6" BorderThickness="0" Margin="8,0,0,0"/><Button x:Name="CopyLogButton" Content="기록 복사" Background="#6B7280" Foreground="White" Padding="11,6" BorderThickness="0" Margin="8,0,0,0"/></StackPanel></Grid></Expander>
-    <Grid Grid.Row="7" Margin="0,18,0,0"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="12"/><ColumnDefinition/></Grid.ColumnDefinitions><Button x:Name="StopButton" Content="연결 끊기" Background="#9F3A38" Foreground="White" Padding="16,10" BorderThickness="0" Visibility="Collapsed"/><Button x:Name="PrimaryButton" Grid.Column="2" Content="다시 확인" Background="#274C43" Foreground="White" Padding="16,10" BorderThickness="0"/></Grid>
+    <Border x:Name="DevicePickerPanel" Grid.Row="4" Background="#EEF4F1" BorderBrush="#C8D8D2" BorderThickness="1" Padding="14,10" Visibility="Collapsed"><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition/></Grid.ColumnDefinitions><TextBlock Text="화면을 띄울 기기" VerticalAlignment="Center" FontSize="13" FontWeight="SemiBold" Foreground="#31564C"/><ComboBox x:Name="DeviceCombo" Grid.Column="1" Padding="8,5" FontSize="13"/></Grid></Border>
+    <Grid Grid.Row="6"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="18"/><ColumnDefinition Width="150"/></Grid.ColumnDefinitions><StackPanel><CheckBox x:Name="AutoConnectCheck" Content="다음부터 케이블 연결 시 자동으로 화면 열기" IsChecked="False" FontSize="13" Foreground="#374151"/><CheckBox x:Name="FullscreenCheck" Content="TV 전체 화면으로 열기" IsChecked="False" Margin="0,10,0,0" FontSize="13" Foreground="#374151"/><TextBlock Text="기본 창 모드에서는 미러 창의 X 한 번으로 종료합니다." Margin="0,10,0,0" FontSize="12" Foreground="#6B7280"/></StackPanel><StackPanel Grid.Column="2"><TextBlock Text="화질" FontSize="13" Foreground="#4B5563" Margin="0,0,0,5"/><ComboBox x:Name="QualityCombo" SelectedIndex="1" FontSize="14" Padding="8,6"><ComboBoxItem Content="빠르게"/><ComboBoxItem Content="균형 있게"/><ComboBoxItem Content="선명하게"/></ComboBox></StackPanel></Grid>
+    <Expander Grid.Row="8" Header="문제가 있을 때만 열기 · 진단 기록" Foreground="#4B5563" FontSize="13"><Grid Margin="0,10,0,0"><Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions><TextBox x:Name="DiagnosticBox" MinHeight="105" IsReadOnly="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" Background="#FAF9F6" BorderBrush="#D6D1C8" FontFamily="Consolas" FontSize="11" Foreground="#374151" Padding="8"/><StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,8,0,0"><Button x:Name="GuideButton" Content="기기별 처음 연결" Background="#6B7280" Foreground="White" Padding="11,6" BorderThickness="0"/><Button x:Name="DriverButton" Content="Windows 드라이버 도움말" Background="#6B7280" Foreground="White" Padding="11,6" BorderThickness="0" Margin="8,0,0,0"/><Button x:Name="CopyLogButton" Content="기록 복사" Background="#6B7280" Foreground="White" Padding="11,6" BorderThickness="0" Margin="8,0,0,0"/></StackPanel></Grid></Expander>
+    <Grid Grid.Row="9" Margin="0,18,0,0"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="12"/><ColumnDefinition/></Grid.ColumnDefinitions><Button x:Name="StopButton" Content="연결 끊기" Background="#9F3A38" Foreground="White" Padding="16,10" BorderThickness="0" Visibility="Collapsed"/><Button x:Name="PrimaryButton" Grid.Column="2" Content="다시 확인" Background="#274C43" Foreground="White" Padding="16,10" BorderThickness="0"/></Grid>
   </Grid>
 </Window>
 '@
 
 $reader = [System.Xml.XmlNodeReader]::new($xaml)
 $window = [Windows.Markup.XamlReader]::Load($reader)
-foreach ($name in @('StatusDot','StatusTitle','StatusDetail','AutoConnectCheck','FullscreenCheck','QualityCombo','DiagnosticBox','GuideButton','DriverButton','CopyLogButton','StopButton','PrimaryButton')) { Set-Variable -Name $name -Value $window.FindName($name) -Scope Script }
-$PrimaryButton.Add_Click({ $state = $PrimaryButton.Tag; if ($null -eq $state) { Refresh-Connection; return }; if ($state.Key -eq 'ready') { Start-Mirror -Device $state.Device; return }; if ($state.Key -eq 'no-device' -or $state.Key -eq 'engine-missing') { Show-SetupGuide; return }; Refresh-Connection })
+foreach ($name in @('StatusDot','StatusTitle','StatusDetail','DevicePickerPanel','DeviceCombo','AutoConnectCheck','FullscreenCheck','QualityCombo','DiagnosticBox','GuideButton','DriverButton','CopyLogButton','StopButton','PrimaryButton')) { Set-Variable -Name $name -Value $window.FindName($name) -Scope Script }
+$PrimaryButton.Add_Click({ $state = $PrimaryButton.Tag; if ($null -eq $state) { Refresh-Connection; return }; if ($state.Key -eq 'ready') { Start-Mirror -Device $state.Device; return }; if ($state.Action -eq '연결 방법') { Show-SetupGuide; return }; Refresh-Connection })
 $StopButton.Add_Click({ Stop-Mirror })
+$DeviceCombo.Add_SelectionChanged({
+    if ($script:IsUpdatingDevicePicker -or $null -eq $DeviceCombo.SelectedItem) { return }
+    $script:SelectedSerial = [string]$DeviceCombo.SelectedItem.Serial
+    $script:LastAutoStartSerial = ''
+    Refresh-Connection -AllowAutoStart:$false
+})
 $GuideButton.Add_Click({ Show-SetupGuide })
-$DriverButton.Add_Click({ Start-Process 'https://developer.samsung.com/android-usb-driver' })
+$DriverButton.Add_Click({ Start-Process 'https://developer.android.com/studio/run/oem-usb' })
 $CopyLogButton.Add_Click({ [System.Windows.Clipboard]::SetText($DiagnosticBox.Text); $CopyLogButton.Content = '복사됨' })
 $timer = [System.Windows.Threading.DispatcherTimer]::new()
 $timer.Interval = [TimeSpan]::FromSeconds(2)
