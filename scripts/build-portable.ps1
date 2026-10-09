@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Version = '0.1.0',
+    [string]$Version = '0.3.0-dev',
     [string]$ScrcpyVersion = '4.1',
     [string]$ScrcpySha256 = '5b12172b3264b2889f4583ee64752ce832e29bc8b1089dca81093459697165db'
 )
@@ -44,7 +44,7 @@ $launcherText = [regex]::Replace($launcherText, "`r?`n", "`r`n")
     $launcherText,
     [System.Text.UTF8Encoding]::new($false)
 )
-Copy-Item -LiteralPath (Join-Path $projectRoot 'app\GomdoryMirror.ps1') -Destination (Join-Path $stagePath 'app')
+Copy-Item -Path (Join-Path $projectRoot 'app\*') -Destination (Join-Path $stagePath 'app') -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot '처음 연결하기.txt') -Destination $stagePath
 Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination $stagePath
 Copy-Item -LiteralPath (Join-Path $projectRoot 'NOTICE') -Destination $stagePath
@@ -54,6 +54,27 @@ Copy-Item -Path (Join-Path $scrcpyFolder.FullName '*') -Destination (Join-Path $
 $zipPath = Join-Path $distPath "Gomdory-Mirror-Portable-v$Version.zip"
 if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
 Compress-Archive -Path (Join-Path $stagePath '*') -DestinationPath $zipPath -CompressionLevel Optimal
+
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+try {
+    $requiredEntries = @(
+        'app\GomdoryMirror.ps1',
+        'app\GomdoryMirror.Core.psm1',
+        'tools\scrcpy\adb.exe',
+        'tools\scrcpy\scrcpy.exe',
+        '곰도리 미러 시작.cmd',
+        '처음 연결하기.txt'
+    )
+    foreach ($requiredEntry in $requiredEntries) {
+        $normalizedRequiredEntry = $requiredEntry -replace '\\', '/'
+        $entry = $archive.Entries | Where-Object { ($_.FullName -replace '\\', '/') -eq $normalizedRequiredEntry } | Select-Object -First 1
+        if ($null -eq $entry -or $entry.Length -le 0) {
+            throw "포터블 ZIP 필수 파일이 없거나 비어 있습니다: $requiredEntry"
+        }
+    }
+}
+finally { $archive.Dispose() }
 
 $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
 Set-Content -LiteralPath "$zipPath.sha256" -Value "$zipHash  $(Split-Path -Leaf $zipPath)" -Encoding ascii
